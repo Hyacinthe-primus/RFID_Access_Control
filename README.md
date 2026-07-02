@@ -21,8 +21,8 @@ administration (adding/removing/renaming users, and a card-UID "scan" mode).
 | Component                | Notes                                                        |
 |---------------------------|---------------------------------------------------------------|
 | ESP32-S3 dev board         | QFN56, rev v0.2, 8MB Octal PSRAM, 40MHz XTAL (as tested). Dual-USB variant (one UART bridge port, one native USB port) |
-| PN532 NFC/RFID module V3   | Must be set to **SPI mode** via onboard DIP switches, see §3 |
-| 16x2 LCD with PCA8574 I2C backpack | Address is usually `0x27` or `0x3F`, see §7 troubleshooting |
+| PN532 NFC/RFID module V3   | Must be set to **SPI mode** via onboard DIP switches, see Section3 |
+| 16x2 LCD with PCA8574 I2C backpack | Address is usually `0x27` or `0x3F`, see Section7 troubleshooting |
 | USB-C / micro-USB cable    | Data-capable, not charge-only                                 |
 | Breadboard + jumper wires  |                                                                |
 
@@ -136,7 +136,7 @@ To avoid logic level issues and brown-outs:
      hang or PSRAM allocations will silently fail. When in doubt, try
      both and check `ESP.getPsramSize()` in serial output at boot.
    - **Upload Speed:** 921600 (or lower if you get upload errors)
-5. Install libraries listed in §2 via `Sketch > Include Library > Manage
+5. Install libraries listed in Section2 via `Sketch > Include Library > Manage
    Libraries`.
 6. `Sketch > Upload`.
 
@@ -225,7 +225,7 @@ Newline-delimited JSON, one object per line, UTF-8.
 |---|---|
 | `getFirmwareVersion()` prints 0 / PN532 not found | DIP switches not set to SPI, or MISO/MOSI swapped |
 | LCD shows nothing / garbled boxes | Wrong I2C address (`0x27` vs `0x3F`); run an I2C scanner sketch to confirm. Could also be a wrong contrast potentiometer setting on the backpack |
-| CLI connects but every command times out ("No valid response after 3 attempts") | You are very likely on the wrong physical USB port. If your board has two USB connectors, this firmware expects the UART-bridge one (CH34x/CP210x), not the native USB port, because USB CDC On Boot is set to Disabled. Confirm with `list_all_ports()` (see §6) and check the VID against your bridge chip's datasheet, not against Espressif's native USB VID (`0x303A`) |
+| CLI connects but every command times out ("No valid response after 3 attempts") | You are very likely on the wrong physical USB port. If your board has two USB connectors, this firmware expects the UART-bridge one (CH34x/CP210x), not the native USB port, because USB CDC On Boot is set to Disabled. Confirm with `list_all_ports()` (see Section6) and check the VID against your bridge chip's datasheet, not against Espressif's native USB VID (`0x303A`) |
 | CLI can't find the device at all | Run `python cli.py list-ports"` inside `python_cli/` to see all visible ports, then pass `--port` explicitly |
 | Upload fails / board not detected by Arduino IDE | Some ESP32-S3 boards need the BOOT button held while the upload starts. Note this is independent of the USB CDC On Boot setting, since esptool always talks to the ROM bootloader over UART0, not native USB |
 | `users.json` keeps resetting to empty | Flash was erased/re-partitioned (e.g. partition scheme changed between uploads). LittleFS content doesn't survive a partition table change |
