@@ -1,0 +1,11 @@
+# Name,     Type, SubType,  Offset,    Size,       Flags
+# 16MB flash total (0x1000000 bytes).
+# Two OTA app slots are kept (1.5MB each) so future firmware updates can
+# still be pushed over-the-air without repartitioning. LittleFS is capped
+# at 12MB (0xC00000) as required -- NOT the full remaining flash. That
+# leaves ~960KB unused/reserved at the top of flash for headroom.
+nvs,       data, nvs,      0x9000,    0x5000,
+otadata,   data, ota,      0xe000,    0x2000,
+app0,      app,  ota_0,    0x10000,   0x180000,
+app1,      app,  ota_1,    0x190000,  0x180000,
+spiffs,    data, spiffs,   0x310000,  0xC00000,
