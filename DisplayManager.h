@@ -17,7 +17,7 @@ public:
   void showBoot();
   void showIdle();
   void showAccessGranted(const String& name);
-  void showAccessDenied();
+  void showAccessDenied(const String& reason = "Unknown Card");
   void showUid(const String& uid);
   void showDatabaseUpdating();
   void showSavingDatabase();
@@ -25,6 +25,8 @@ public:
   void showScanMode();
   void showSerialConnected();
   void showSerialDisconnected();
+  void showWifiConnecting();
+  void showWifiResult(bool connected);
   void showError(const String& message);
 
 private:

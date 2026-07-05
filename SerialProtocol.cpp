@@ -4,6 +4,7 @@
 
 #include "SerialProtocol.h"
 #include "DatabaseManager.h"
+#include "NetworkManager.h"
 #include "Config.h"
 
 void SerialProtocol::begin(SerialMessageHandler handler) {
@@ -36,7 +37,9 @@ void SerialProtocol::poll() {
 }
 
 void SerialProtocol::handleLine_(const char* line) {
-  DynamicJsonDocument doc(1024);
+  // Matches kLineBufCapacity -- see the comment there ('remove_all_except'
+  // is the message that needs the extra headroom).
+  DynamicJsonDocument doc(kLineBufCapacity);
   DeserializationError err = deserializeJson(doc, line);
 
   if (err) {
@@ -72,6 +75,35 @@ void SerialProtocol::sendUidDetected(const String& uid) {
   Serial.println();
 }
 
+void SerialProtocol::sendRemovedCount(size_t removedCount) {
+  DynamicJsonDocument doc(256);
+  doc["status"] = "ok";
+  doc["type"] = "remove_all_except";
+  doc["removed_count"] = removedCount;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void SerialProtocol::sendWifiResult(bool connected, const String& message) {
+  DynamicJsonDocument doc(256);
+  doc["status"] = connected ? "ok" : "error";
+  doc["type"] = "wifi_status";
+  doc["connected"] = connected;
+  doc["message"] = message;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void SerialProtocol::sendNtpSyncResult(bool synced, const String& message) {
+  DynamicJsonDocument doc(256);
+  doc["status"] = synced ? "ok" : "error";
+  doc["type"] = "ntp_sync";
+  doc["synced"] = synced;
+  doc["message"] = message;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
 void SerialProtocol::sendStatus(DatabaseManager& db) {
   DynamicJsonDocument doc(512);
   doc["status"] = "ok";
@@ -88,14 +120,55 @@ void SerialProtocol::sendStatus(DatabaseManager& db) {
 }
 
 void SerialProtocol::sendUserList(DatabaseManager& db) {
-  DynamicJsonDocument doc(DB_JSON_CAPACITY);
-  doc["status"] = "ok";
-  JsonArray arr = doc.createNestedArray("users");
+  // Stream the response directly to Serial, one user at a time.
+  // Avoids a single huge DynamicJsonDocument (~500KB for 4500 users).
+  Serial.print("{\"status\":\"ok\",\"users\":[");
   for (size_t i = 0; i < db.userCount(); i++) {
-    JsonObject o = arr.createNestedObject();
-    o["uid"] = db.userAt(i).uid;
-    o["name"] = db.userAt(i).name;
+    if (i > 0) Serial.print(',');
+    const auto& u = db.userAt(i);
+    Serial.print("{\"uid\":\"");
+    Serial.print(u.uid);
+    Serial.print("\",\"name\":\"");
+    Serial.print(u.name);
+    Serial.print("\",\"registered\":\"");
+    Serial.print(u.registered);
+    Serial.print("\",\"valid_days\":");
+    Serial.print(u.validDays);
+    Serial.print('}');
   }
+  Serial.println("]}");
+}
+
+void SerialProtocol::sendNetStatus(WifiTimeManager& net) {
+  DynamicJsonDocument doc(512);
+  doc["status"] = "ok";
+  doc["type"] = "net_status";
+  bool connected = net.isWifiConnected();
+  doc["connected"] = connected;
+  doc["ssid"] = net.currentSsid();
+  doc["ip"] = net.currentIp();
+  doc["rssi"] = net.currentRssi();
+  doc["time_synced"] = net.isTimeSynced();
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void SerialProtocol::sendImportResult(size_t added, size_t errors) {
+  DynamicJsonDocument doc(256);
+  doc["status"] = (errors == 0) ? "ok" : "error";
+  doc["type"] = "import_result";
+  doc["added"] = added;
+  doc["errors"] = errors;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void SerialProtocol::sendTime(time_t epoch, const String& formatted) {
+  DynamicJsonDocument doc(256);
+  doc["status"] = "ok";
+  doc["type"] = "time";
+  doc["epoch"] = (double)epoch;
+  doc["formatted"] = formatted;
   serializeJson(doc, Serial);
   Serial.println();
 }

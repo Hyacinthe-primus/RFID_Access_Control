@@ -29,7 +29,6 @@
 // Filesystem
 #define USERS_DB_PATH      "/users.json"
 #define USERS_DB_TMP_PATH  "/users.tmp"
-#define DB_JSON_CAPACITY   16384   // bytes reserved for the ArduinoJson document
 
 // Timing (all non-blocking, millis()-based) 
 #define BOOT_SCREEN_MIN_MS     2500
@@ -37,9 +36,30 @@
 #define UID_DISPLAY_MS         2000
 #define CARD_COOLDOWN_MS       2500
 #define RFID_POLL_TIMEOUT_MS   50
-#define SERIAL_BAUD             115200
+#define SERIAL_BAUD             921600
 
 // Validation
 #define MAX_NAME_LEN   48
+#define MAX_USERS      2000    // RAM limit — beyond this, heap overflows on ESP32-S3 SRAM
 #define MIN_UID_HEX_LEN 8      // 4 bytes minimum (MIFARE Classic UID)
 #define MAX_UID_HEX_LEN 20     // 10 bytes maximum (double UID)
+#define REGISTERED_DATE_LEN 10 // strlen("YYYY-MM-DD")
+
+// Wi-Fi / NTP time sync
+// Credentials are never hardcoded here -- they are provisioned at runtime
+// via the 'configure_wifi' serial command and persisted in NVS (Preferences).
+#define WIFI_CONNECT_TIMEOUT_MS   10000   // how long begin()/configure will block waiting to associate
+#define NTP_SERVER_1              "pool.ntp.org"
+#define NTP_SERVER_2              "time.nist.gov"
+// The Python CLI stamps 'registered' using the LOCAL calendar date of the
+// machine running the CLI. Set these two offsets to that same timezone so
+// the firmware's expiration math (Config.h-adjacent, see
+// SystemController::isUserExpired_) lines up with it. Default is UTC+0
+// change to your timezone, e.g. UTC+2 => NTP_GMT_OFFSET_SEC = 7200.
+#define NTP_GMT_OFFSET_SEC        0   // UTC+0
+#define NTP_DAYLIGHT_OFFSET_SEC   0
+#define NTP_SYNC_TIMEOUT_MS       8000    // how long to wait for time() to become sane
+#define NTP_RESYNC_INTERVAL_MS    (6UL * 60UL * 60UL * 1000UL)  // re-sync every 6h to correct drift
+
+// Buzzer (passive, driven via ledc/tone -- never a delay()-blocking tone)
+#define BUZZER_PIN   6

@@ -37,8 +37,8 @@ void DisplayManager::showAccessGranted(const String& name) {
   printTwoLines_("ACCESS GRANTED", name);
 }
 
-void DisplayManager::showAccessDenied() {
-  printTwoLines_("ACCESS DENIED", "Unknown Card");
+void DisplayManager::showAccessDenied(const String& reason) {
+  printTwoLines_("ACCESS DENIED", reason);
 }
 
 void DisplayManager::showUid(const String& uid) {
@@ -67,6 +67,14 @@ void DisplayManager::showSerialConnected() {
 
 void DisplayManager::showSerialDisconnected() {
   printTwoLines_("SERIAL", "Disconnected");
+}
+
+void DisplayManager::showWifiConnecting() {
+  printTwoLines_("WIFI", "Connecting...");
+}
+
+void DisplayManager::showWifiResult(bool connected) {
+  printTwoLines_("WIFI", connected ? "Connected" : "Failed");
 }
 
 void DisplayManager::showError(const String& message) {

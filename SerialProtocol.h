@@ -25,7 +25,17 @@ public:
   void sendError(const String& message);
   void sendUidDetected(const String& uid);
 
-  // Sends {"status":"ok","users":[{"uid":"...","name":"..."}, ...]}
+  // Sends {"status":"ok","type":"remove_all_except","removed_count":N}
+  void sendRemovedCount(size_t removedCount);
+
+  // Sends {"status":"ok"|"error","type":"wifi_status","connected":bool,"message":"..."}
+  void sendWifiResult(bool connected, const String& message);
+
+  // Sends {"status":"ok"|"error","type":"ntp_sync","synced":bool,"message":"..."}
+  void sendNtpSyncResult(bool synced, const String& message);
+
+  // Sends {"status":"ok","users":[{"uid":"...","name":"...",
+  //        "registered":"YYYY-MM-DD","valid_days":N}, ...]}
   void sendUserList(class DatabaseManager& db);
 
   // Sends {"status":"ok","type":"status","db_path":"...",
@@ -33,8 +43,21 @@ public:
   //        "user_count":N}
   void sendStatus(class DatabaseManager& db);
 
+  // Sends {"status":"ok","type":"net_status","connected":bool,
+  //        "ssid":"...","ip":"...","rssi":N,"time_synced":bool}
+  void sendNetStatus(class WifiTimeManager& net);
+
+  // Sends {"status":"ok"|"error","type":"import_result","added":N,"errors":N}
+  void sendImportResult(size_t added, size_t errors);
+
+  // Sends {"status":"ok","type":"time","epoch":N,"formatted":"YYYY-MM-DD HH:MM:SS"}
+  void sendTime(time_t epoch, const String& formatted);
+
 private:
-  static const size_t kLineBufCapacity = 1024;
+  // 4096 (not 1024) because 'remove_all_except' can carry an array of many
+  // UIDs in one line -- a few dozen UIDs plus JSON punctuation comfortably
+  // clears the old 1024-byte ceiling. ESP32-S3 has plenty of SRAM to spare.
+  static const size_t kLineBufCapacity = 4096;
   char lineBuf_[kLineBufCapacity];
   size_t lineLen_ = 0;
   SerialMessageHandler handler_;

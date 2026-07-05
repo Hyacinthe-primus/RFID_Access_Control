@@ -29,7 +29,7 @@ KNOWN_ESP32_VID_PID = {
     (0x1A86, 0x55D4),
 }
 
-DEFAULT_BAUD = 115200
+DEFAULT_BAUD = 921600
 DEFAULT_TIMEOUT_S = 2.0
 DEFAULT_RETRIES = 3
 
@@ -116,6 +116,31 @@ class SerialManager:
         # sometimes reset on port open).
         time.sleep(1.5)
         self._conn.reset_input_buffer()
+        # Wait for the firmware to finish booting (Wi-Fi + NTP can take
+        # several seconds). We try sending a 'status' command until we get
+        # a valid JSON response, up to 15 seconds.
+        self._wait_for_ready()
+
+    def _wait_for_ready(self) -> None:
+        """Poll the device with 'status' until it responds with valid JSON,
+        confirming the firmware has finished booting."""
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            self._conn.reset_input_buffer()
+            self._conn.write(encode_message({"type": "status"}))
+            self._conn.flush()
+            raw = self._conn.readline()
+            if not raw:
+                time.sleep(0.5)
+                continue
+            try:
+                decode_message(raw)
+                return  # firmware is ready
+            except ProtocolError:
+                time.sleep(0.5)
+                continue
+        # If we get here, the device didn't respond in time -- proceed
+        # anyway and let the actual command fail with a clear error.
 
     def close(self) -> None:
         if self._conn and self._conn.is_open:

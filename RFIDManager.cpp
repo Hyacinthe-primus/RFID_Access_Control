@@ -15,17 +15,9 @@ bool RFIDManager::begin() {
 
   uint32_t versiondata = nfc_.getFirmwareVersion();
   if (!versiondata) {
-    Serial.println("[RFID] PN532 not found. Check SPI wiring and DIP switches.");
     ready_ = false;
     return false;
   }
-
-  Serial.print("[RFID] Found PN5");
-  Serial.print((versiondata >> 24) & 0xFF, HEX);
-  Serial.print(" firmware v");
-  Serial.print((versiondata >> 16) & 0xFF, DEC);
-  Serial.print('.');
-  Serial.println((versiondata >> 8) & 0xFF, DEC);
 
   // Configure the max retries to 0xFF (infinite) internally is not desired;
   // we want SAMConfig for normal passive reads.

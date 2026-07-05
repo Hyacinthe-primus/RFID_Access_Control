@@ -5,9 +5,13 @@
  * This is the only class that knows the full state machine. Everything
  * else is a dumb-ish component with one job.
  *
- * All timing is millis()-based. There is exactly one delay() in this whole
- * firmware (see .cpp) and it is 0 -- kept out entirely on purpose so the
- * serial link never stalls while a card result is being displayed.
+ * All timing is millis()-based and the RFID/serial/buzzer loop never
+ * blocks. The only blocking waits left in the firmware are bounded,
+ * one-off admin/setup operations that already had this shape before Wi-Fi
+ * was added: the boot-screen minimum-duration wait, and now Wi-Fi
+ * connect + NTP sync (at boot, and when 'configure_wifi' is received).
+ * Those are intentionally synchronous so the operator/CLI gets an
+ * immediate success/failure result instead of a fire-and-forget one.
  */
 
 #include <Arduino.h>
@@ -15,6 +19,8 @@
 #include "DisplayManager.h"
 #include "RFIDManager.h"
 #include "SerialProtocol.h"
+#include "NetworkManager.h"
+#include "BuzzerManager.h"
 
 enum class SystemState {
   BOOT,
@@ -35,6 +41,8 @@ private:
   DisplayManager display_;
   RFIDManager rfid_;
   SerialProtocol serial_;
+  WifiTimeManager network_;
+  BuzzerManager buzzer_;
 
   SystemState state_ = SystemState::BOOT;
   uint32_t stateEnteredMs_ = 0;
@@ -56,6 +64,12 @@ private:
   void handleCardDetected_(const String& uid);
   void handleSerialMessage_(JsonDocument& doc);
   void handleSerialConnectionChange_();
+
+  // Expiration check per the spec:
+  //   expiration_date = registered + valid_days
+  //   granted if current_date_time <= expiration_date
+  // Fails safe (treated as expired) if time hasn't been NTP-synced yet.
+  bool isUserExpired_(const UserRecord& user, bool& timeAvailableOut) const;
 
   // Wraps any filesystem-mutating DB call: pauses RFID, shows the
   // "DATABASE UPDATING" screen, runs the operation, restores the screen.
