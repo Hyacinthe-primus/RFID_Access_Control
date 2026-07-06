@@ -40,7 +40,7 @@
 
 // Validation
 #define MAX_NAME_LEN   48
-#define MAX_USERS      2000    // RAM limit — beyond this, heap overflows on ESP32-S3 SRAM
+#define MAX_USERS      10000   // PSRAM-backed; SRAM-only limit was ~2000
 #define MIN_UID_HEX_LEN 8      // 4 bytes minimum (MIFARE Classic UID)
 #define MAX_UID_HEX_LEN 20     // 10 bytes maximum (double UID)
 #define REGISTERED_DATE_LEN 10 // strlen("YYYY-MM-DD")

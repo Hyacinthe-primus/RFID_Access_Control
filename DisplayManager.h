@@ -28,6 +28,7 @@ public:
   void showWifiConnecting();
   void showWifiResult(bool connected);
   void showError(const String& message);
+  void showRenewingTag();
 
 private:
   LiquidCrystal_I2C lcd_{LCD_I2C_ADDR, LCD_COLS, LCD_ROWS};

@@ -163,6 +163,19 @@ void SerialProtocol::sendImportResult(size_t added, size_t errors) {
   Serial.println();
 }
 
+void SerialProtocol::sendRenewalResult(const String& uid, const String& name,
+                                       const String& registered, double validDays) {
+  DynamicJsonDocument doc(256);
+  doc["status"] = "ok";
+  doc["type"] = "renewal_result";
+  doc["uid"] = uid;
+  doc["name"] = name;
+  doc["registered"] = registered;
+  doc["valid_days"] = validDays;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
 void SerialProtocol::sendTime(time_t epoch, const String& formatted) {
   DynamicJsonDocument doc(256);
   doc["status"] = "ok";

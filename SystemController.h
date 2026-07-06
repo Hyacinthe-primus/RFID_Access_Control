@@ -54,6 +54,8 @@ private:
   String pendingUid_;
 
   bool scanModeActive_ = false;
+  bool renewalActive_ = false;
+  double renewalValidDays_ = 0.0;
 
   // Serial connection tracking (native USB CDC on ESP32-S3 reflects host DTR)
   bool serialWasConnected_ = false;

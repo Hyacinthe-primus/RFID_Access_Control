@@ -15,8 +15,8 @@ public:
   void begin();
   void update();           // call every loop()
 
-  void playGranted();      // pleasant ascending sequence
-  void playDenied();       // descending/error sequence
+  void playGranted();      // pleasant ascending sequence, ~1.5s total
+  void playDenied();       // descending/error sequence, ~1.5s total
 
 private:
   struct Note {

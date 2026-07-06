@@ -6,6 +6,7 @@
 #include "Config.h"
 #include <cstring>
 #include <time.h>
+#include <esp_heap_caps.h>
 
 namespace {
   // Formats a time_t (epoch seconds) into "YYYY-MM-DD HH:MM:SS" in local
@@ -58,8 +59,6 @@ void SystemController::begin() {
 
   if (!db_.begin()) {
     display_.showError("DB INIT FAIL");
-    // Keep going -- an empty in-RAM DB still lets ACCESS DENIED work,
-    // and the operator can retry 'add' once they notice the error.
   }
 
   bool rfidOk = rfid_.begin();
@@ -94,7 +93,10 @@ void SystemController::enterState_(SystemState s) {
 }
 
 void SystemController::restoreIdleOrScanScreen_() {
-  if (scanModeActive_) {
+  if (renewalActive_) {
+    state_ = SystemState::SCAN_MODE;
+    display_.showRenewingTag();
+  } else if (scanModeActive_) {
     state_ = SystemState::SCAN_MODE;
     display_.showScanMode();
   } else {
@@ -130,8 +132,15 @@ void SystemController::update() {
 
     case SystemState::RESULT_DISPLAY:
       if (now - stateEnteredMs_ >= RESULT_DISPLAY_MS) {
-        display_.showUid(pendingUid_);
-        enterState_(SystemState::UID_DISPLAY);
+        if (renewalActive_) {
+          // In renewal mode, skip UID screen — go straight back to
+          // "RENEWING NFC TAG" so the operator can present the next card.
+          restoreIdleOrScanScreen_();
+          enterState_(state_);
+        } else {
+          display_.showUid(pendingUid_);
+          enterState_(SystemState::UID_DISPLAY);
+        }
       }
       break;
 
@@ -190,6 +199,41 @@ void SystemController::handleCardDetected_(const String& uid) {
     return;
   }
 
+  if (renewalActive_) {
+    // Renewal mode: look up the UID, update registered + valid_days,
+    // report the result, then return to renewal mode.
+    UserRecord user;
+    bool found = db_.findUser(uid, user);
+    if (found) {
+      // Get today's date via NTP-synced clock
+      time_t now = network_.nowUtc() + NTP_GMT_OFFSET_SEC + NTP_DAYLIGHT_OFFSET_SEC;
+      struct tm* t = localtime(&now);
+      char todayBuf[11];
+      snprintf(todayBuf, sizeof(todayBuf), "%04d-%02d-%02d",
+               t->tm_year + 1900, t->tm_mon + 1, t->tm_mday);
+      String today(todayBuf);
+
+      String err;
+      bool ok = db_.renewUser(uid, today, renewalValidDays_, err);
+      if (ok) {
+        db_.findUser(uid, user);
+        serial_.sendRenewalResult(uid, user.name, user.registered, user.validDays);
+        display_.showAccessGranted("RENEWED " + user.name);
+        buzzer_.playGranted();
+      } else {
+        serial_.sendError(err);
+        display_.showError(err);
+        buzzer_.playDenied();
+      }
+    } else {
+      serial_.sendError("UID not in database");
+      display_.showAccessDenied("Unknown");
+      buzzer_.playDenied();
+    }
+    enterState_(SystemState::RESULT_DISPLAY);
+    return;
+  }
+
   UserRecord user;
   bool found = db_.findUser(uid, user);
 
@@ -235,6 +279,7 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
     // which the DatabaseManager validators accept and which `UserRecord::isAdmin()`
     // later recognises. A normal badge still sends both fields as before.
     // ---------------------------------------------------------------------
+    
     String registered;
     double validDays;
     bool adminBadge = !doc.containsKey("registered") || !doc.containsKey("valid_days");
@@ -421,14 +466,38 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
     return;
   }
 
+  if (strcmp(type, "enter_renewal_mode") == 0) {
+    if (!doc.containsKey("valid_days")) {
+      serial_.sendError("Missing 'valid_days'");
+      return;
+    }
+    renewalValidDays_ = doc["valid_days"].as<double>();
+    renewalActive_ = true;
+    scanModeActive_ = false;
+    enterState_(SystemState::SCAN_MODE);
+    display_.showRenewingTag();
+    serial_.sendOk();
+    return;
+  }
+
+  if (strcmp(type, "exit_renewal_mode") == 0) {
+    renewalActive_ = false;
+    enterState_(SystemState::IDLE);
+    display_.showIdle();
+    serial_.sendOk();
+    return;
+  }
+
   if (strcmp(type, "enter_scan_mode") == 0) {
     if (state_ == SystemState::RESULT_DISPLAY || state_ == SystemState::UID_DISPLAY) {
       // Don't interrupt a result that's still being shown to whoever
       // just badged in -- scan mode will engage on the next update().
     }
-    scanModeActive_ = true;
+    if (!renewalActive_) {
+      scanModeActive_ = true;
+      display_.showScanMode();
+    }
     enterState_(SystemState::SCAN_MODE);
-    display_.showScanMode();
     serial_.sendOk();
     return;
   }

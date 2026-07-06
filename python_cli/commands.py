@@ -97,7 +97,7 @@ def cmd_add(args) -> None:
         utils.error("Name cannot be empty.")
         raise SystemExit(1)
 
-    # --Admin badge handling
+    # --- Admin badge handling -------------------------------------------------
     # If the user did NOT pass --valid-days on the command line, we treat the
     # new badge as an ADMIN card: no expiration, no registration date. The
     # firmware stores it with sentinel values (registered="", valid_days=-1)
@@ -108,7 +108,7 @@ def cmd_add(args) -> None:
     # with nothing else asked. To create a normal expiring badge
     # interactively (with the prompt), still pass --uid and --name on the
     # command line; --valid-days is the only field that triggers admin mode.
-    
+    # --------------------------------------------------------------------------
     if args.valid_days is None:
         registered: Optional[str] = None
         valid_days: Optional[float] = None
@@ -315,6 +315,77 @@ def cmd_scan(args) -> None:
         raise SystemExit(1)
 
 
+def cmd_tag_renew(args) -> None:
+    """Renew NFC tags: present cards one by one to update their validity.
+
+    Each scanned tag gets registered=today and valid_days set to the
+    given value. Only tags already in the device database are renewed.
+    LCD shows "RENEWING NFC TAG" during the process.
+    """
+    valid_days = _validate_valid_days_or_exit(args.valid_days)
+    quota_raw = getattr(args, "quota", None)
+    quota = None
+    if quota_raw is not None and quota_raw.lower() != "none":
+        try:
+            quota = int(quota_raw)
+            if quota <= 0:
+                utils.error("Quota must be a positive integer or 'none'.")
+                raise SystemExit(1)
+        except ValueError:
+            utils.error(f"Invalid quota '{quota_raw}'. Use a number or 'none'.")
+            raise SystemExit(1)
+
+    try:
+        with SerialManager(port=args.port) as sm:
+            ack = sm.request(protocol.build_enter_renewal_mode(valid_days))
+            require_ok(ack)
+            utils.info(f"Renewal mode active (valid_days={valid_days}). Present cards to the reader.")
+            utils.info("Press Ctrl+C to stop.")
+            _install_keyboard_interrupt_handler()
+
+            count = 0
+            try:
+                while True:
+                    if quota is not None and count >= quota:
+                        utils.info(f"Quota reached ({quota}). Stopping.")
+                        break
+                    # In renewal mode the firmware stays in SCAN_MODE and
+                    # sends a renewal_result each time a card is presented.
+                    # No need to send enter_scan_mode between cards.
+                    try:
+                        raw = sm._read_line()
+                    except SerialManagerError:
+                        continue  # timeout waiting for card, keep looping
+                    if not raw:
+                        continue
+                    try:
+                        resp = protocol.decode_message(raw)
+                    except Exception:
+                        continue  # malformed line, skip
+                    if resp.get("type") == "renewal_result":
+                        uid = resp.get("uid", "?")
+                        name = resp.get("name", "?")
+                        reg = resp.get("registered", "?")
+                        vd = resp.get("valid_days", "?")
+                        count += 1
+                        utils.success(f"#{count}  {uid} ({name}) -> registered={reg}, valid_days={vd}")
+                    elif resp.get("status") == "error":
+                        msg = resp.get("message", "unknown error")
+                        utils.error(f"  {msg}")
+            except KeyboardInterrupt:
+                utils.info("\nRenewal stopped by user (Ctrl+C).")
+                utils.info(f"Total tags renewed: {count}")
+            finally:
+                _restore_default_sigint_handler()
+                try:
+                    sm.request(protocol.build_exit_renewal_mode())
+                except Exception:
+                    pass
+    except (SerialManagerError, DatabaseResponseError) as exc:
+        utils.error(str(exc))
+        raise SystemExit(1)
+
+
 def cmd_configure_wifi(args) -> None:
     ssid = args.ssid or input("Wi-Fi SSID: ").strip()
     password = args.password if args.password is not None else input("Wi-Fi password: ").strip()
@@ -386,13 +457,13 @@ def cmd_import(args) -> None:
                 require_ok(resp)
                 utils.success("All users removed.")
             else:
-                # Check current user count to warn about the 2000-user limit.
+                # Check current user count to warn about the 10000-user limit.
                 status_resp = sm.request(protocol.build_status())
                 current = status_resp.get("user_count", 0)
-                if current + len(entries) > 2000:
+                if current + len(entries) > 10000:
                     utils.error(
                         f"Device has {current} users, import would add {len(entries)} "
-                        f"(total {current + len(entries)}). Max is 2000. "
+                        f"(total {current + len(entries)}). Max is 10000. "
                         f"Use --clear to wipe first, or reduce the file."
                     )
                     raise SystemExit(1)
@@ -590,6 +661,10 @@ def cmd_export(args) -> None:
 
     utils.success(f"Exported {len(data)} user(s) to {args.file}.")
 
+
+# -----------------------------------------------------------------------------
+# Signal handling helpers for scan --infinite
+# -----------------------------------------------------------------------------
 
 _previous_sigint = None
 

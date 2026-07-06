@@ -1,6 +1,6 @@
 /*
  * DatabaseManager.cpp
- */
+*/
 
 #include "DatabaseManager.h"
 #include "Config.h"
@@ -38,7 +38,7 @@ void DatabaseManager::rebuildIndex_() {
 bool DatabaseManager::load() {
   if (!LittleFS.exists(USERS_DB_PATH)) {
     recreateEmpty_();
-    return false; // triggers save() of an empty DB by caller
+    return false;
   }
 
   File f = LittleFS.open(USERS_DB_PATH, "r");
@@ -47,7 +47,7 @@ bool DatabaseManager::load() {
     return false;
   }
 
-  DynamicJsonDocument doc(256 * 1024);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, f);
   f.close();
 
@@ -56,7 +56,7 @@ bool DatabaseManager::load() {
     return false;
   }
 
-  std::vector<UserRecord> loaded;
+  std::vector<UserRecord, PsramAllocator<UserRecord>> loaded;
   for (JsonObject obj : doc.as<JsonArray>()) {
     if (!obj.containsKey("uid") || !obj.containsKey("name")) continue;
     UserRecord u;
@@ -125,7 +125,7 @@ bool DatabaseManager::addUser(const String& uid, const String& name, const Strin
   if (!isValidName(name)) { errorOut = "Invalid or empty name"; return false; }
   if (!isValidRegisteredDate(registered)) { errorOut = "Invalid 'registered' date (expected YYYY-MM-DD)"; return false; }
   if (!isValidValidDays(validDays)) { errorOut = "Invalid 'valid_days' (must be a non-negative number)"; return false; }
-  if (users_.size() >= MAX_USERS) { errorOut = "Database full (max 2000 users)"; return false; }
+  if (users_.size() >= MAX_USERS) { errorOut = "Database full (max 10000 users)"; return false; }
   if (uidIndex_.count(norm)) { errorOut = "Duplicate UID"; return false; }
 
   UserRecord u;
@@ -183,9 +183,9 @@ bool DatabaseManager::removeAllExcept(const std::vector<String>& keepUids, size_
     keepNorm.push_back(norm);
   }
 
-  std::vector<UserRecord> backup = users_;
+  std::vector<UserRecord, PsramAllocator<UserRecord>> backup = users_;
 
-  std::vector<UserRecord> kept;
+  std::vector<UserRecord, PsramAllocator<UserRecord>> kept;
   kept.reserve(users_.size());
   for (const auto& u : users_) {
     bool keep = false;
@@ -212,9 +212,9 @@ bool DatabaseManager::removeAllExcept(const std::vector<String>& keepUids, size_
 bool DatabaseManager::clearAll(String& errorOut) {
   // Snapshot in RAM so we can roll back atomically if the save fails --
   // same shape as removeUser/renameUser, just at the whole-database scale.
-  std::vector<UserRecord> backup;
+  std::vector<UserRecord, PsramAllocator<UserRecord>> backup;
   backup.swap(users_);
-  std::set<String> backupIndex;
+  std::set<String, std::less<String>, PsramAllocator<String>> backupIndex;
   backupIndex.swap(uidIndex_);
 
   if (!save()) {
@@ -246,6 +246,26 @@ bool DatabaseManager::findUser(const String& uid, UserRecord& outUser) const {
   int idx = indexOfUid_(uid);
   if (idx < 0) return false;
   outUser = users_[idx];
+  return true;
+}
+
+bool DatabaseManager::renewUser(const String& uid, const String& today,
+                                double validDays, String& errorOut) {
+  String norm = normalizeUid(uid);
+  int idx = indexOfUid_(norm);
+  if (idx < 0) { errorOut = "UID not found"; return false; }
+
+  String oldRegistered = users_[idx].registered;
+  double oldValidDays = users_[idx].validDays;
+  users_[idx].registered = today;
+  users_[idx].validDays = validDays;
+
+  if (!save()) {
+    errorOut = "Failed to persist database";
+    users_[idx].registered = oldRegistered;
+    users_[idx].validDays = oldValidDays;
+    return false;
+  }
   return true;
 }
 
@@ -334,7 +354,7 @@ bool DatabaseManager::addUserNoSave(const String& uid, const String& name,
   if (!isValidName(name)) { errorOut = "Invalid or empty name"; return false; }
   if (!isValidRegisteredDate(registered)) { errorOut = "Invalid 'registered' date (expected YYYY-MM-DD)"; return false; }
   if (!isValidValidDays(validDays)) { errorOut = "Invalid 'valid_days' (must be a non-negative number)"; return false; }
-  if (users_.size() >= MAX_USERS) { errorOut = "Database full (max 2000 users)"; return false; }
+  if (users_.size() >= MAX_USERS) { errorOut = "Database full (max 10000 users)"; return false; }
   if (uidIndex_.count(norm)) { errorOut = "Duplicate UID"; return false; }
 
   UserRecord u;

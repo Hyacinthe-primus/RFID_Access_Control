@@ -80,3 +80,7 @@ void DisplayManager::showWifiResult(bool connected) {
 void DisplayManager::showError(const String& message) {
   printTwoLines_("ERROR", message);
 }
+
+void DisplayManager::showRenewingTag() {
+  printTwoLines_("RENEWING NFC TAG", "Present Card...");
+}

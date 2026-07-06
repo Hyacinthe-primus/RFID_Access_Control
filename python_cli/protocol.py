@@ -81,6 +81,16 @@ def build_enter_scan_mode() -> Dict[str, Any]:
     return {"type": "enter_scan_mode"}
 
 
+def build_enter_renewal_mode(valid_days: float) -> Dict[str, Any]:
+    """Enter renewal mode: each scanned card updates registered=today and valid_days."""
+    return {"type": "enter_renewal_mode", "valid_days": valid_days}
+
+
+def build_exit_renewal_mode() -> Dict[str, Any]:
+    """Exit renewal mode and return to idle."""
+    return {"type": "exit_renewal_mode"}
+
+
 def build_status() -> Dict[str, Any]:
     return {"type": "status"}
 

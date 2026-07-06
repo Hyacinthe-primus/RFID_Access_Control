@@ -140,6 +140,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_scan.set_defaults(func=commands.cmd_scan)
 
+    p_tag_renew = sub.add_parser(
+        "tag-renew",
+        help="Renew NFC tags: present cards to update their validity",
+    )
+    p_tag_renew.add_argument("valid_days", type=float, help="New validity period in days")
+    p_tag_renew.add_argument(
+        "--quota", default=None,
+        help="Max tags to renew (number), or 'none' for unlimited (Ctrl+C to stop)",
+    )
+    p_tag_renew.set_defaults(func=commands.cmd_tag_renew)
+
     p_list_ports = sub.add_parser("list-ports", help="List all serial ports (for debugging)")
     p_list_ports.set_defaults(func=commands.cmd_list_ports)
 
@@ -178,7 +189,7 @@ def main() -> None:
     args = parser.parse_args()
 
     commands_needing_port = {
-        "list", "find", "add", "remove", "rename", "scan",
+        "list", "find", "add", "remove", "rename", "scan", "tag-renew",
         "status", "netstatus", "ntp-time", "ntp-sync", "configure", "import", "export",
     }
 

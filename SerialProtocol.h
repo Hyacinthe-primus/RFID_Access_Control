@@ -50,6 +50,10 @@ public:
   // Sends {"status":"ok"|"error","type":"import_result","added":N,"errors":N}
   void sendImportResult(size_t added, size_t errors);
 
+  // Sends {"status":"ok"|"error","type":"renewal_result","uid":"...","name":"...","registered":"...","valid_days":N}
+  void sendRenewalResult(const String& uid, const String& name,
+                         const String& registered, double validDays);
+
   // Sends {"status":"ok","type":"time","epoch":N,"formatted":"YYYY-MM-DD HH:MM:SS"}
   void sendTime(time_t epoch, const String& formatted);
 
