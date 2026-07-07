@@ -15,6 +15,7 @@ Usage:
     python cli.py ntp-time                                      # device current time
     python cli.py ntp-sync                                      # force NTP resync
     python cli.py configure -w SSID -p PASSWORD
+    python cli.py timezone --offset SECONDS [--dst SECONDS]      # set device timezone
     python cli.py import FILE [--dry-run] [--clear]             # batch import from JSON or CSV
     python cli.py export FILE                                   # export DB to JSON
     python cli.py list-ports                                    # list all serial ports
@@ -42,6 +43,12 @@ Notes
 - `ntp-time` shows the device's current local time after NTP sync.
 
 - `ntp-sync` forces an NTP resync on the device.
+
+- `timezone --offset SECONDS` sets and persists the device's GMT offset
+  (e.g. 3600 for UTC+1, -18000 for UTC-5). Optional `--dst SECONDS` adds a
+  daylight-saving offset on top. Persists in NVS and survives reboots --
+  no reflash needed. Must match the timezone of the machine running this
+  CLI (see the 'registered' date docs in README.md).
 
 The serial port is auto-detected; pass --port to override.
 """
@@ -159,6 +166,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_configure.add_argument("-p", "--password", dest="password", help="Wi-Fi password")
     p_configure.set_defaults(func=commands.cmd_configure_wifi)
 
+    p_timezone = sub.add_parser(
+        "timezone",
+        help="Set and persist the device's timezone (no reflash needed)",
+    )
+    p_timezone.add_argument(
+        "--offset", dest="gmt_offset_sec", type=int, required=True,
+        help="GMT offset in seconds, e.g. 3600 for UTC+1, -18000 for UTC-5",
+    )
+    p_timezone.add_argument(
+        "--dst", dest="daylight_offset_sec", type=int, default=0,
+        help="Daylight-saving offset in seconds, added on top of --offset (default: 0)",
+    )
+    p_timezone.set_defaults(func=commands.cmd_configure_timezone)
+
     p_import = sub.add_parser(
         "import",
         help="Import users from a JSON or CSV file (batch, single flash write)",
@@ -190,7 +211,7 @@ def main() -> None:
 
     commands_needing_port = {
         "list", "find", "add", "remove", "rename", "scan", "tag-renew",
-        "status", "netstatus", "ntp-time", "ntp-sync", "configure", "import", "export",
+        "status", "netstatus", "ntp-time", "ntp-sync", "configure", "timezone", "import", "export",
     }
 
     if args.command in commands_needing_port and args.port is None:

@@ -153,10 +153,35 @@ class SerialManager:
             raise SerialManagerError("Timed out waiting for a response from the device.")
         return line
 
+    # Error messages that mean "this already happened" when they show up
+    # on a RETRY (attempt > 1) of a specific command type. They only ever
+    # indicate a lost response, not a real failure, when the *same*
+    # request is being resent -- on attempt 1 they are genuine errors and
+    # are returned as-is.
+    _RETRY_SAFE_ERRORS = {
+        "add": ("duplicate uid",),
+        "remove": ("uid not found",),
+        "rename": ("uid not found",),
+    }
+
     def request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Send one message, return the decoded response. Retries on
-        timeout or malformed-JSON responses up to self.retries times."""
+        timeout or malformed-JSON responses up to self.retries times.
+
+        Caveat this works around: 'add'/'remove'/'rename' are NOT
+        idempotent on the device. If attempt 1's command was processed but
+        its response was lost (e.g. a slow flash write pushes the reply
+        past self.timeout), a naive retry resends the same command and
+        gets back a legitimate-looking error ("Duplicate UID" / "UID not
+        found") for an operation that actually already succeeded. Only on
+        a retry (attempt > 1) do we treat those specific errors for those
+        specific command types as a synthesized success -- on attempt 1
+        they're real errors and are surfaced normally.
+        """
         assert self._conn is not None, "SerialManager not opened -- use 'with SerialManager(...) as sm:'"
+
+        msg_type = payload.get("type", "")
+        safe_errors = self._RETRY_SAFE_ERRORS.get(msg_type, ())
 
         last_error: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
@@ -165,11 +190,23 @@ class SerialManager:
                 self._conn.write(encode_message(payload))
                 self._conn.flush()
                 raw = self._read_line()
-                return decode_message(raw)
+                response = decode_message(raw)
             except (SerialManagerError, ProtocolError, serial.SerialException) as exc:
                 last_error = exc
                 time.sleep(0.3)
                 continue
+
+            if (attempt > 1 and response.get("status") == "error" and safe_errors
+                    and str(response.get("message", "")).lower() in safe_errors):
+                return {
+                    "status": "ok",
+                    "note": (
+                        f"Treated as success: '{response.get('message')}' on a "
+                        f"retry of '{msg_type}' means the first attempt already "
+                        f"went through, only its reply was lost."
+                    ),
+                }
+            return response
 
         raise SerialManagerError(
             f"No valid response after {self.retries} attempts: {last_error}"

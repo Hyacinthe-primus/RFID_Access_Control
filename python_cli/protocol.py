@@ -114,6 +114,16 @@ def build_ntp_sync() -> Dict[str, Any]:
     return {"type": "ntp_sync"}
 
 
+def build_configure_timezone(gmt_offset_sec: int, daylight_offset_sec: int = 0) -> Dict[str, Any]:
+    """Set and persist the device's GMT/DST offset (NVS, survives reboot;
+    no reflash needed)."""
+    return {
+        "type": "configure_timezone",
+        "gmt_offset_sec": gmt_offset_sec,
+        "daylight_offset_sec": daylight_offset_sec,
+    }
+
+
 def build_import_begin() -> Dict[str, Any]:
     """Start a batch-import session. Subsequent 'add' calls are buffered
     in RAM only; the database is written to flash once at import_end."""

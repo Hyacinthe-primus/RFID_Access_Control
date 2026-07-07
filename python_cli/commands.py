@@ -56,6 +56,51 @@ def _validate_uid_or_exit(uid: str) -> str:
     return norm
 
 
+def _auto_backup_before_wipe(sm, reason: str) -> Optional[str]:
+    """Fetches the current device database and writes it to a timestamped
+    backup file before a destructive operation (remove --force,
+    import --clear). Best-effort: a backup failure is reported but does
+    NOT block the destructive operation, since the operator explicitly
+    asked for it -- we only try to make it recoverable, not blocking.
+    Returns the backup filepath, or None if there was nothing to back up
+    or the backup failed.
+    """
+    import json as _json
+    import os
+
+    try:
+        response = sm.request(protocol.build_list())
+        users = parse_user_list(response)
+    except (SerialManagerError, DatabaseResponseError) as exc:
+        utils.error(f"Auto-backup skipped -- could not read device database: {exc}")
+        return None
+
+    if not users:
+        return None  # nothing to lose
+
+    os.makedirs("backups", exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    filepath = os.path.join("backups", f"pre_{reason}_{stamp}.json")
+
+    data = []
+    for u in users:
+        entry = {"uid": u.uid, "name": u.name}
+        if not u.is_admin:
+            entry["registered"] = u.registered
+            entry["valid_days"] = u.valid_days
+        data.append(entry)
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        utils.error(f"Auto-backup failed ({exc}) -- proceeding anyway since it was requested.")
+        return None
+
+    utils.info(f"Auto-backup: saved {len(data)} user(s) to {filepath} before wipe.")
+    return filepath
+
+
 def cmd_list(args) -> None:
     try:
         with SerialManager(port=args.port) as sm:
@@ -153,6 +198,7 @@ def cmd_remove(args) -> None:
     if force:
         try:
             with SerialManager(port=args.port) as sm:
+                _auto_backup_before_wipe(sm, "remove_force")
                 response = sm.request(protocol.build_clear_all())
             require_ok(response)
             utils.success("Removed ALL users from the device database.")
@@ -386,6 +432,31 @@ def cmd_tag_renew(args) -> None:
         raise SystemExit(1)
 
 
+def cmd_configure_timezone(args) -> None:
+    """Set and persist the device's GMT/DST offset. Applied immediately
+    (the device re-syncs NTP against it) and survives reboots -- no
+    reflash needed."""
+    try:
+        with SerialManager(port=args.port) as sm:
+            response = sm.request(
+                protocol.build_configure_timezone(args.gmt_offset_sec, args.daylight_offset_sec)
+            )
+        if response.get("applied"):
+            total = response.get("gmt_offset_sec", args.gmt_offset_sec) + \
+                response.get("daylight_offset_sec", args.daylight_offset_sec)
+            utils.success(
+                f"Timezone set: GMT offset {response.get('gmt_offset_sec')}s, "
+                f"DST offset {response.get('daylight_offset_sec')}s "
+                f"(total UTC{'+' if total >= 0 else ''}{total // 3600}h). Persisted."
+            )
+        else:
+            utils.error(response.get("message", "Device failed to apply the new timezone."))
+            raise SystemExit(1)
+    except (SerialManagerError, DatabaseResponseError) as exc:
+        utils.error(str(exc))
+        raise SystemExit(1)
+
+
 def cmd_configure_wifi(args) -> None:
     ssid = args.ssid or input("Wi-Fi SSID: ").strip()
     password = args.password if args.password is not None else input("Wi-Fi password: ").strip()
@@ -452,6 +523,7 @@ def cmd_import(args) -> None:
     try:
         with SerialManager(port=args.port) as sm:
             if clear_first:
+                _auto_backup_before_wipe(sm, "import_clear")
                 utils.info("Clearing existing users...")
                 resp = sm.request(protocol.build_clear_all())
                 require_ok(resp)
