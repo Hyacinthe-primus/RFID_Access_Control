@@ -7,6 +7,12 @@ namespace {
   const char* kPrefsNamespace = "wifi";
   const char* kKeySsid = "ssid";
   const char* kKeyPass = "pass";
+  // Timezone is stored in the same NVS namespace as the Wi-Fi credentials
+  // -- both are "provisioned at runtime, persist across reboots" settings
+  // owned by WifiTimeManager, so there's no reason to split them out.
+  const char* kKeyGmtOffset = "gmt_off";
+  const char* kKeyDstOffset = "dst_off";
+  const char* kKeyTzSet     = "tz_set";   // "1" once configure_timezone has run
 }
 
 void WifiTimeManager::loadCredentials_(String& ssidOut, String& passOut) {
@@ -25,6 +31,59 @@ void WifiTimeManager::saveCredentials_(const String& ssid, const String& passwor
   prefs.end();
 }
 
+void WifiTimeManager::loadTimezone_() {
+  Preferences prefs;
+  prefs.begin(kPrefsNamespace, true);
+  bool tzSet = prefs.getString(kKeyTzSet, "") == "1";
+  if (tzSet) {
+    gmtOffsetSec_ = prefs.getLong(kKeyGmtOffset, NTP_GMT_OFFSET_SEC);
+    daylightOffsetSec_ = prefs.getInt(kKeyDstOffset, NTP_DAYLIGHT_OFFSET_SEC);
+  } else {
+    // Never configured via 'configure_timezone' -- fall back to the
+    // compile-time default in Config.h.
+    gmtOffsetSec_ = NTP_GMT_OFFSET_SEC;
+    daylightOffsetSec_ = NTP_DAYLIGHT_OFFSET_SEC;
+  }
+  prefs.end();
+}
+
+void WifiTimeManager::saveTimezone_(long gmtOffsetSec, int daylightOffsetSec) {
+  Preferences prefs;
+  prefs.begin(kPrefsNamespace, false);
+  prefs.putLong(kKeyGmtOffset, gmtOffsetSec);
+  prefs.putInt(kKeyDstOffset, daylightOffsetSec);
+  prefs.putString(kKeyTzSet, "1");
+  prefs.end();
+}
+
+bool WifiTimeManager::setTimezone(long gmtOffsetSec, int daylightOffsetSec) {
+  long oldGmt = gmtOffsetSec_;
+  int oldDst = daylightOffsetSec_;
+  gmtOffsetSec_ = gmtOffsetSec;
+  daylightOffsetSec_ = daylightOffsetSec;
+
+  if (!isWifiConnected()) {
+    // No network yet to verify against an NTP server -- still accept and
+    // persist it; it'll be applied on the next successful sync (boot or
+    // reconnect). resyncTime()/isWifiConnected() checks already fail
+    // safely elsewhere when there's no time sync.
+    saveTimezone_(gmtOffsetSec_, daylightOffsetSec_);
+    return true;
+  }
+
+  if (!syncTimeBlocking_(NTP_SYNC_TIMEOUT_MS)) {
+    // Roll back in RAM so a bad offset (e.g. unreachable NTP right now)
+    // doesn't leave isUserExpired_() computing against a half-applied
+    // value until the caller retries.
+    gmtOffsetSec_ = oldGmt;
+    daylightOffsetSec_ = oldDst;
+    return false;
+  }
+
+  saveTimezone_(gmtOffsetSec_, daylightOffsetSec_);
+  return true;
+}
+
 bool WifiTimeManager::connectBlocking_(const String& ssid, const String& password, uint32_t timeoutMs) {
   if (ssid.length() == 0) return false;
   WiFi.mode(WIFI_STA);
@@ -37,7 +96,7 @@ bool WifiTimeManager::connectBlocking_(const String& ssid, const String& passwor
 }
 
 bool WifiTimeManager::syncTimeBlocking_(uint32_t timeoutMs) {
-  configTime(NTP_GMT_OFFSET_SEC, NTP_DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
+  configTime(gmtOffsetSec_, daylightOffsetSec_, NTP_SERVER_1, NTP_SERVER_2);
   uint32_t start = millis();
   time_t now = time(nullptr);
   while (now < 1600000000 && (millis() - start) < timeoutMs) {
@@ -50,6 +109,7 @@ bool WifiTimeManager::syncTimeBlocking_(uint32_t timeoutMs) {
 }
 
 void WifiTimeManager::begin() {
+  loadTimezone_();
   String ssid, password;
   loadCredentials_(ssid, password);
   if (ssid.length() == 0) {
