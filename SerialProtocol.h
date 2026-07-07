@@ -57,6 +57,11 @@ public:
   // Sends {"status":"ok","type":"time","epoch":N,"formatted":"YYYY-MM-DD HH:MM:SS"}
   void sendTime(time_t epoch, const String& formatted);
 
+  // Sends {"status":"ok"|"error","type":"timezone","applied":bool,
+  //        "gmt_offset_sec":N,"daylight_offset_sec":N,"message":"..."}
+  void sendTimezoneResult(bool applied, long gmtOffsetSec, int daylightOffsetSec,
+                          const String& message);
+
 private:
   // 4096 (not 1024) because 'remove_all_except' can carry an array of many
   // UIDs in one line -- a few dozen UIDs plus JSON punctuation comfortably

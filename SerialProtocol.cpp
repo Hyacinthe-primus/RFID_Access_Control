@@ -127,9 +127,9 @@ void SerialProtocol::sendUserList(DatabaseManager& db) {
     if (i > 0) Serial.print(',');
     const auto& u = db.userAt(i);
     Serial.print("{\"uid\":\"");
-    Serial.print(u.uid);
+    Serial.print(u.uid); // hex-only, never needs escaping
     Serial.print("\",\"name\":\"");
-    Serial.print(u.name);
+    Serial.print(DatabaseManager::jsonEscape(u.name));
     Serial.print("\",\"registered\":\"");
     Serial.print(u.registered);
     Serial.print("\",\"valid_days\":");
@@ -182,6 +182,19 @@ void SerialProtocol::sendTime(time_t epoch, const String& formatted) {
   doc["type"] = "time";
   doc["epoch"] = (double)epoch;
   doc["formatted"] = formatted;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void SerialProtocol::sendTimezoneResult(bool applied, long gmtOffsetSec, int daylightOffsetSec,
+                                        const String& message) {
+  DynamicJsonDocument doc(256);
+  doc["status"] = applied ? "ok" : "error";
+  doc["type"] = "timezone";
+  doc["applied"] = applied;
+  doc["gmt_offset_sec"] = gmtOffsetSec;
+  doc["daylight_offset_sec"] = daylightOffsetSec;
+  doc["message"] = message;
   serializeJson(doc, Serial);
   Serial.println();
 }

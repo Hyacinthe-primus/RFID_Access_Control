@@ -24,7 +24,7 @@
 
 #include <Arduino.h>
 #include <vector>
-#include <set>
+#include <map>
 #include <esp_heap_caps.h>
 
 // PSRAM allocator for STL containers.  Routes malloc/free to the 8MB
@@ -123,11 +123,28 @@ public:
   static bool isValidRegisteredDate(const String& registered);
   static bool isValidValidDays(double validDays);
 
+  // Escapes a string for safe manual embedding inside a hand-built JSON
+  // string literal (used by save() and SerialProtocol::sendUserList(),
+  // which write "uid"/"name" directly to a stream instead of going
+  // through ArduinoJson). Without this, a name containing '"' or '\'
+  // corrupts users.json on the next save() -- which then fails to parse
+  // on the next boot and silently wipes the whole database via
+  // recreateEmpty_(). Handles '"', '\', control chars (\n, \r, \t, and
+  // anything < 0x20 via \u00XX).
+  static String jsonEscape(const String& in);
+
 private:
   std::vector<UserRecord, PsramAllocator<UserRecord>> users_;
-  std::set<String, std::less<String>, PsramAllocator<String>> uidIndex_;
+  // Maps normalized uid -> index into users_. Previously this was a
+  // std::set<String> used only to reject duplicates on insert, while every
+  // lookup (findUser/removeUser/renameUser/renewUser -- i.e. every single
+  // badge scan) fell back to a linear scan over users_ via indexOfUid_().
+  // At MAX_USERS that made every card tap an O(n) scan despite the index
+  // existing. Storing the index turns those into real O(log n) lookups.
+  std::map<String, size_t, std::less<String>,
+           PsramAllocator<std::pair<const String, size_t>>> uidIndex_;
   bool importMode_ = false;
   void recreateEmpty_();
-  void rebuildIndex_();         // rebuilds uidIndex_ from users_ (call after bulk replace)
+  void rebuildIndex_();         // rebuilds uidIndex_ from users_ (call after any index-shifting change)
   int indexOfUid_(const String& uid) const;
 };

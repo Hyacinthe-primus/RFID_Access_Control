@@ -32,7 +32,7 @@ void DatabaseManager::recreateEmpty_() {
 
 void DatabaseManager::rebuildIndex_() {
   uidIndex_.clear();
-  for (const auto& u : users_) uidIndex_.insert(u.uid);
+  for (size_t i = 0; i < users_.size(); i++) uidIndex_[users_[i].uid] = i;
 }
 
 bool DatabaseManager::load() {
@@ -93,9 +93,9 @@ bool DatabaseManager::save() {
     const auto& u = users_[i];
     // Manual JSON encoding per object -- avoids ArduinoJson entirely.
     f.print("{\"uid\":\"");
-    f.print(u.uid);
+    f.print(u.uid); // uid is normalizeUid()'d to [0-9A-F] only -- never needs escaping
     f.print("\",\"name\":\"");
-    f.print(u.name);
+    f.print(jsonEscape(u.name));
     f.print("\",\"registered\":\"");
     f.print(u.registered);
     f.print("\",\"valid_days\":");
@@ -112,10 +112,9 @@ bool DatabaseManager::save() {
 
 int DatabaseManager::indexOfUid_(const String& uid) const {
   String norm = normalizeUid(uid);
-  for (size_t i = 0; i < users_.size(); i++) {
-    if (users_[i].uid == norm) return (int)i;
-  }
-  return -1;
+  auto it = uidIndex_.find(norm);
+  if (it == uidIndex_.end()) return -1;
+  return (int)it->second;
 }
 
 bool DatabaseManager::addUser(const String& uid, const String& name, const String& registered,
@@ -134,7 +133,7 @@ bool DatabaseManager::addUser(const String& uid, const String& name, const Strin
   u.registered = registered;
   u.validDays = validDays;
   users_.push_back(u);
-  uidIndex_.insert(norm);
+  uidIndex_[norm] = users_.size() - 1;
 
   if (!importMode_) {
     if (!save()) { errorOut = "Failed to persist database"; users_.pop_back(); uidIndex_.erase(norm); return false; }
@@ -148,12 +147,15 @@ bool DatabaseManager::removeUser(const String& uid, String& errorOut) {
 
   UserRecord backup = users_[idx];
   users_.erase(users_.begin() + idx);
-  uidIndex_.erase(backup.uid);
+  // Every user after idx just shifted down by one position -- a plain
+  // uidIndex_.erase(backup.uid) would leave all of their stored indices
+  // stale (off by one), silently breaking future lookups for them.
+  rebuildIndex_();
 
   if (!save()) {
     errorOut = "Failed to persist database";
     users_.insert(users_.begin() + idx, backup);
-    uidIndex_.insert(backup.uid);
+    rebuildIndex_();
     return false;
   }
   return true;
@@ -214,7 +216,8 @@ bool DatabaseManager::clearAll(String& errorOut) {
   // same shape as removeUser/renameUser, just at the whole-database scale.
   std::vector<UserRecord, PsramAllocator<UserRecord>> backup;
   backup.swap(users_);
-  std::set<String, std::less<String>, PsramAllocator<String>> backupIndex;
+  std::map<String, size_t, std::less<String>,
+           PsramAllocator<std::pair<const String, size_t>>> backupIndex;
   backupIndex.swap(uidIndex_);
 
   if (!save()) {
@@ -302,11 +305,43 @@ size_t DatabaseManager::fsUsedBytes() const {
 
 bool DatabaseManager::isValidName(const String& name) {
   if (name.length() == 0 || name.length() > MAX_NAME_LEN) return false;
-  // Reject names that are pure whitespace.
+  bool sawNonSpace = false;
   for (size_t i = 0; i < name.length(); i++) {
-    if (!isspace((unsigned char)name[i])) return true;
+    unsigned char c = (unsigned char)name[i];
+    // Control characters (incl. \n, \r, \t) are rejected outright: even
+    // though jsonEscape() would now encode them safely, they'd still
+    // garble the 16x2 LCD line. '"' and '\' ARE allowed here -- they're
+    // valid in a display name and are made safe by jsonEscape() at every
+    // write site (save() and sendUserList()).
+    if (c < 0x20) return false;
+    if (!isspace(c)) sawNonSpace = true;
   }
-  return false;
+  // Reject names that are pure whitespace.
+  return sawNonSpace;
+}
+
+String DatabaseManager::jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in[i];
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if ((unsigned char)c < 0x20) {
+          char buf[7];
+          snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
 }
 
 bool DatabaseManager::isValidRegisteredDate(const String& registered) {
@@ -363,6 +398,6 @@ bool DatabaseManager::addUserNoSave(const String& uid, const String& name,
   u.registered = registered;
   u.validDays = validDays;
   users_.push_back(u);
-  uidIndex_.insert(norm);
+  uidIndex_[norm] = users_.size() - 1;
   return true;
 }
