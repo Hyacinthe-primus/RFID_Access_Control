@@ -155,6 +155,25 @@ void SystemController::update() {
       // Only reached transiently inside withDbBusyScreen_; update() should
       // never observe this state because that helper is synchronous.
       break;
+
+    case SystemState::LOCKOUT:
+      // Deliberately does NOT poll rfid_ here -- cards presented during a
+      // lockout are ignored entirely, not just denied (denying them would
+      // just restart the same cooldown pointlessly). Serial/CLI commands
+      // keep working as normal via serial_.poll() above, so an operator
+      // can still investigate or fix the database during a lockout.
+      if (now - stateEnteredMs_ >= LOCKOUT_DURATION_MS) {
+        consecutiveDenials_ = 0;
+        lockoutLastShownSec_ = -1;
+        restoreIdleOrScanScreen_();
+      } else {
+        int32_t remainingSec = (int32_t)((LOCKOUT_DURATION_MS - (now - stateEnteredMs_) + 999) / 1000);
+        if (remainingSec != lockoutLastShownSec_) {
+          lockoutLastShownSec_ = remainingSec;
+          display_.showLockout((uint32_t)remainingSec);
+        }
+      }
+      break;
   }
 }
 
@@ -176,12 +195,14 @@ bool SystemController::isUserExpired_(const UserRecord& user, bool& timeAvailabl
   }
 
   // 'registered' is a bare calendar date with no timezone info -- it's
-  // interpreted in the same local timezone as NTP_GMT_OFFSET_SEC/
-  // NTP_DAYLIGHT_OFFSET_SEC (see Config.h), which must match the timezone
-  // of the machine running the Python CLI for this to line up correctly.
+  // interpreted in the device's currently configured timezone (runtime
+  // value in WifiTimeManager, settable via the 'configure_timezone' serial
+  // command / `cli.py timezone`, defaulting to Config.h's NTP_GMT_OFFSET_SEC/
+  // NTP_DAYLIGHT_OFFSET_SEC until then), which must match the timezone of
+  // the machine running the Python CLI for this to line up correctly.
   time_t registeredEpoch = parseRegisteredDateUtc(user.registered);
   double expirationEpoch = (double)registeredEpoch + user.validDays * 86400.0;
-  double currentLocalEpoch = (double)network_.nowUtc() + NTP_GMT_OFFSET_SEC + NTP_DAYLIGHT_OFFSET_SEC;
+  double currentLocalEpoch = (double)network_.nowUtc() + network_.gmtOffsetSec() + network_.daylightOffsetSec();
   // nowUtc() returns raw UTC; configTime() only affects localtime(), not
   // time(NULL), so the manual addition here is correct and NOT a double count.
 
@@ -206,7 +227,7 @@ void SystemController::handleCardDetected_(const String& uid) {
     bool found = db_.findUser(uid, user);
     if (found) {
       // Get today's date via NTP-synced clock
-      time_t now = network_.nowUtc() + NTP_GMT_OFFSET_SEC + NTP_DAYLIGHT_OFFSET_SEC;
+      time_t now = network_.nowUtc() + network_.gmtOffsetSec() + network_.daylightOffsetSec();
       struct tm* t = localtime(&now);
       char todayBuf[11];
       snprintf(todayBuf, sizeof(todayBuf), "%04d-%02d-%02d",
@@ -246,17 +267,29 @@ void SystemController::handleCardDetected_(const String& uid) {
   pendingName_ = granted ? user.name : String("");
 
   if (granted) {
+    consecutiveDenials_ = 0;
     display_.showAccessGranted(pendingName_);
     buzzer_.playGranted();
-  } else if (found && expired && !timeAvailable) {
+    enterState_(SystemState::RESULT_DISPLAY);
+    return;
+  }
+
+  if (found && expired && !timeAvailable) {
     display_.showAccessDenied("No Time Sync");
-    buzzer_.playDenied();
   } else if (found && expired) {
     display_.showAccessDenied("Expired");
-    buzzer_.playDenied();
   } else {
     display_.showAccessDenied();
-    buzzer_.playDenied();
+  }
+  buzzer_.playDenied();
+
+  consecutiveDenials_++;
+  if (consecutiveDenials_ >= MAX_CONSECUTIVE_DENIALS) {
+    consecutiveDenials_ = 0;      // fresh count for after the lockout lifts
+    lockoutLastShownSec_ = -1;
+    enterState_(SystemState::LOCKOUT);
+    display_.showLockout(LOCKOUT_DURATION_MS / 1000);
+    return;
   }
   enterState_(SystemState::RESULT_DISPLAY);
 }
@@ -401,8 +434,8 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
       serial_.sendError("NTP time not synced yet");
       return;
     }
-    // configTime() already applied NTP_GMT_OFFSET_SEC so localtime()
-    // returns local time -- do NOT add the offset again.
+    // configTime() already applied the configured GMT/DST offset so
+    // localtime() returns local time -- do NOT add the offset again.
     time_t now = network_.nowUtc();
     String formatted = formatLocalTime(now);
     serial_.sendTime(now, formatted);
@@ -524,6 +557,30 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
 
     serial_.sendWifiResult(connected,
       connected ? "Wi-Fi connected and time synced" : "Failed to connect with the given credentials");
+    return;
+  }
+
+  if (strcmp(type, "configure_timezone") == 0) {
+    if (!doc.containsKey("gmt_offset_sec")) {
+      serial_.sendError("Missing 'gmt_offset_sec'");
+      return;
+    }
+    long gmtOffsetSec = doc["gmt_offset_sec"].as<long>();
+    int daylightOffsetSec = doc.containsKey("daylight_offset_sec")
+        ? doc["daylight_offset_sec"].as<int>() : 0;
+
+    SystemState previous = state_;
+    state_ = SystemState::DB_BUSY; // reuses the "block the idle/scan screen" state
+    display_.showWifiConnecting(); // reuses the "..." busy screen, close enough for a brief blocking op
+
+    bool applied = network_.setTimezone(gmtOffsetSec, daylightOffsetSec);
+
+    state_ = previous;
+    restoreIdleOrScanScreen_();
+
+    serial_.sendTimezoneResult(applied, network_.gmtOffsetSec(), network_.daylightOffsetSec(),
+      applied ? "Timezone applied and persisted"
+              : "Could not resync NTP with the new offset -- not persisted, previous timezone kept");
     return;
   }
 

@@ -84,3 +84,7 @@ void DisplayManager::showError(const String& message) {
 void DisplayManager::showRenewingTag() {
   printTwoLines_("RENEWING NFC TAG", "Present Card...");
 }
+
+void DisplayManager::showLockout(uint32_t secondsRemaining) {
+  printTwoLines_("LOCKED - TOO MANY", "TRIES (" + String(secondsRemaining) + "s)");
+}

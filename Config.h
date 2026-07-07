@@ -52,10 +52,16 @@
 #define NTP_SERVER_1              "pool.ntp.org"
 #define NTP_SERVER_2              "time.nist.gov"
 // The Python CLI stamps 'registered' using the LOCAL calendar date of the
-// machine running the CLI. Set these two offsets to that same timezone so
-// the firmware's expiration math (Config.h-adjacent, see
-// SystemController::isUserExpired_) lines up with it. Default is UTC+0
-// change to your timezone, e.g. UTC+2 => NTP_GMT_OFFSET_SEC = 7200.
+// machine running the CLI. The device's timezone must match it so the
+// firmware's expiration math (see SystemController::isUserExpired_) lines
+// up correctly.
+//
+// These two constants are now only the FIRST-BOOT DEFAULT -- once a
+// timezone has been set via the 'configure_timezone' serial command (see
+// `python cli.py timezone`), the value persisted in NVS (WifiTimeManager)
+// always takes priority and survives reflashing the same value here. You
+// only need to edit these if you want a different out-of-the-box default
+// before ever calling 'configure_timezone'.
 #define NTP_GMT_OFFSET_SEC        0   // UTC+0
 #define NTP_DAYLIGHT_OFFSET_SEC   0
 #define NTP_SYNC_TIMEOUT_MS       8000    // how long to wait for time() to become sane
@@ -63,3 +69,12 @@
 
 // Buzzer (passive, driven via ledc/tone -- never a delay()-blocking tone)
 #define BUZZER_PIN   6
+
+// Anti-brute-force lockout: after this many consecutive DENIED badges
+// (unknown UID or expired -- NOT admin/granted, which resets the
+// counter), the reader stops accepting cards for LOCKOUT_DURATION_MS.
+// Does not affect the serial/CLI link, which stays fully usable during
+// a lockout (e.g. to inspect the database or add the legitimate badge
+// that was being rejected).
+#define MAX_CONSECUTIVE_DENIALS   5
+#define LOCKOUT_DURATION_MS       (30UL * 1000UL)   // 30s

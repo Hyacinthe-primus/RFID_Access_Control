@@ -28,7 +28,8 @@ enum class SystemState {
   SCAN_MODE,
   RESULT_DISPLAY,   // showing ACCESS GRANTED / DENIED
   UID_DISPLAY,       // showing the UID: xxxx screen that follows a result
-  DB_BUSY
+  DB_BUSY,
+  LOCKOUT           // too many consecutive denied badges -- reader ignores cards
 };
 
 class SystemController {
@@ -56,6 +57,15 @@ private:
   bool scanModeActive_ = false;
   bool renewalActive_ = false;
   double renewalValidDays_ = 0.0;
+
+  // Anti-brute-force: counts consecutive DENIED badges (reset on any
+  // GRANTED badge). At MAX_CONSECUTIVE_DENIALS the reader enters
+  // SystemState::LOCKOUT for LOCKOUT_DURATION_MS. See Config.h.
+  int consecutiveDenials_ = 0;
+  // Last "seconds remaining" value drawn on the LCD during LOCKOUT, so we
+  // only touch the (slow) I2C display once per second instead of once per
+  // update() call.
+  int32_t lockoutLastShownSec_ = -1;
 
   // Serial connection tracking (native USB CDC on ESP32-S3 reflects host DTR)
   bool serialWasConnected_ = false;
