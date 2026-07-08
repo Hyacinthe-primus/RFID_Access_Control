@@ -22,6 +22,17 @@ backed by PSRAM (8MB on ESP32-S3).
 
 ---
 
+## Getting Started
+
+```bash
+git clone https://github.com/Hyacinthe-primus/RFID_Access_Control.git
+cd RFID_Access_Control
+```
+
+Then follow Section 5 to flash the firmware, and Section 6 to set up the Python CLI.
+
+---
+
 ## 1. Hardware Required
 
 | Component                | Notes                                                        |
