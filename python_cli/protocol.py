@@ -35,12 +35,7 @@ def decode_message(raw_line: bytes) -> Dict[str, Any]:
 # Message builders (mirror what SystemController::handleSerialMessage_ expects)
 
 def build_add(uid: str, name: str, registered: Optional[str], valid_days: Optional[float]) -> Dict[str, Any]:
-    """Build an 'add' message.
-
-    If `registered` or `valid_days` is None the message is sent WITHOUT those
-    fields, and the firmware interprets that as "admin NFC card" -- no
-    registration date, no expiration, always granted.
-    """
+    """Build 'add' message. None fields = admin badge."""
     msg: Dict[str, Any] = {
         "type": "add",
         "uid": uid,
@@ -63,9 +58,7 @@ def build_clear_all() -> Dict[str, Any]:
 
 
 def build_remove_all_except(keep_uids: List[str]) -> Dict[str, Any]:
-    """Delete every user NOT in keep_uids. keep_uids must be non-empty --
-    the firmware rejects an empty list rather than treating it as
-    'delete everyone' (use build_clear_all() for that instead)."""
+    """Delete every user NOT in keep_uids (must be non-empty; use build_clear_all() to wipe all)."""
     return {"type": "remove_all_except", "uids": keep_uids}
 
 
@@ -77,8 +70,23 @@ def build_list() -> Dict[str, Any]:
     return {"type": "list"}
 
 
+def build_find_by_uid(uid: str) -> Dict[str, Any]:
+    """Single-UID lookup (O(log n) device-side binary search)."""
+    return {"type": "find", "uid": uid}
+
+
+def build_find_by_name(query: str) -> Dict[str, Any]:
+    """Device-side name substring match. Only matches cross Serial."""
+    return {"type": "find_name", "query": query}
+
+
 def build_enter_scan_mode() -> Dict[str, Any]:
     return {"type": "enter_scan_mode"}
+
+
+def build_exit_scan_mode() -> Dict[str, Any]:
+    """Exit scan mode and return to idle (waiting-card screen)."""
+    return {"type": "exit_scan_mode"}
 
 
 def build_enter_renewal_mode(valid_days: float) -> Dict[str, Any]:
@@ -125,12 +133,52 @@ def build_configure_timezone(gmt_offset_sec: int, daylight_offset_sec: int = 0) 
 
 
 def build_import_begin() -> Dict[str, Any]:
-    """Start a batch-import session. Subsequent 'add' calls are buffered
-    in RAM only; the database is written to flash once at import_end."""
+    """Enter import mode. RAM-only until import_end."""
     return {"type": "import_begin"}
 
 
 def build_import_end() -> Dict[str, Any]:
-    """Finalize a batch-import session: persist all buffered users to flash
-    in a single write and report how many were added."""
+    """Persist once, report counts."""
     return {"type": "import_end"}
+
+
+def build_batch_add(entries) -> Dict[str, Any]:
+    """Batch add N users (import mode only). entries: (uid, name, registered, valid_days) tuples."""
+    users = []
+    for uid, name, registered, valid_days in entries:
+        u: Dict[str, Any] = {"uid": uid, "name": name}
+        if registered is not None:
+            u["registered"] = registered
+        if valid_days is not None:
+            u["valid_days"] = valid_days
+        users.append(u)
+    return {"type": "batch_add", "users": users}
+
+
+def build_import_bin(nbytes: int) -> Dict[str, Any]:
+    """Announce N raw bytes incoming (import mode only, no mid-transfer retry)."""
+    return {"type": "import_bin", "bytes": nbytes}
+
+
+def build_export_bin() -> Dict[str, Any]:
+    """Request raw binary export. Response = JSON header + N raw bytes."""
+    return {"type": "export_bin"}
+
+
+def build_sync_begin() -> Dict[str, Any]:
+    """Ask for the device's current db_crc32 + count. Stateless query --
+    if the crc already matches the host's local file, nothing else needs
+    to be sent."""
+    return {"type": "sync_begin"}
+
+
+def build_sync_manifest() -> Dict[str, Any]:
+    """Request the (uid, record_crc32) manifest. Response = JSON header +
+    N raw manifest entries (see convert.MANIFEST_ENTRY_SIZE)."""
+    return {"type": "sync_manifest"}
+
+
+def build_sync_apply(remove_count: int, add_count: int, replace_count: int) -> Dict[str, Any]:
+    """Announce the ops about to be streamed. Response = ok (ack, start
+    streaming raw bytes), then a final sync_result once applied."""
+    return {"type": "sync_apply", "remove": remove_count, "add": add_count, "replace": replace_count}
