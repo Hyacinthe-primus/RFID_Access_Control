@@ -27,8 +27,11 @@
 #define LCD_ROWS    2
 
 // Filesystem
-#define USERS_DB_PATH      "/users.json"
-#define USERS_DB_TMP_PATH  "/users.tmp"
+// USERS_DB_PATH: binary DB (see DatabaseManager.h). Legacy JSON is
+// auto-migrated on first boot, kept as .bak for recovery.
+#define USERS_DB_PATH             "/users.bin"
+#define USERS_DB_LEGACY_JSON_PATH "/users.json"
+#define USERS_DB_TMP_PATH         "/users.tmp"
 
 // Timing (all non-blocking, millis()-based) 
 #define BOOT_SCREEN_MIN_MS     2500
@@ -36,32 +39,21 @@
 #define UID_DISPLAY_MS         2000
 #define CARD_COOLDOWN_MS       2500
 #define RFID_POLL_TIMEOUT_MS   50
-#define SERIAL_BAUD             921600
+#define SERIAL_BAUD            2000000
 
 // Validation
 #define MAX_NAME_LEN   48
-#define MAX_USERS      10000   // PSRAM-backed; SRAM-only limit was ~2000
+#define MAX_USERS      70000   // PSRAM-backed; SRAM-only limit was ~2000
 #define MIN_UID_HEX_LEN 8      // 4 bytes minimum (MIFARE Classic UID)
 #define MAX_UID_HEX_LEN 20     // 10 bytes maximum (double UID)
 #define REGISTERED_DATE_LEN 10 // strlen("YYYY-MM-DD")
 
-// Wi-Fi / NTP time sync
-// Credentials are never hardcoded here -- they are provisioned at runtime
-// via the 'configure_wifi' serial command and persisted in NVS (Preferences).
-#define WIFI_CONNECT_TIMEOUT_MS   10000   // how long begin()/configure will block waiting to associate
+// Wi-Fi / NTP -- credentials provisioned at runtime via 'configure_wifi'.
+#define WIFI_CONNECT_TIMEOUT_MS   10000
 #define NTP_SERVER_1              "pool.ntp.org"
 #define NTP_SERVER_2              "time.nist.gov"
-// The Python CLI stamps 'registered' using the LOCAL calendar date of the
-// machine running the CLI. The device's timezone must match it so the
-// firmware's expiration math (see SystemController::isUserExpired_) lines
-// up correctly.
-//
-// These two constants are now only the FIRST-BOOT DEFAULT -- once a
-// timezone has been set via the 'configure_timezone' serial command (see
-// `python cli.py timezone`), the value persisted in NVS (WifiTimeManager)
-// always takes priority and survives reflashing the same value here. You
-// only need to edit these if you want a different out-of-the-box default
-// before ever calling 'configure_timezone'.
+// Timezone: first-boot defaults, overridden by 'configure_timezone' (NVS).
+// Device timezone must match the CLI machine's timezone.
 #define NTP_GMT_OFFSET_SEC        0   // UTC+0
 #define NTP_DAYLIGHT_OFFSET_SEC   0
 #define NTP_SYNC_TIMEOUT_MS       8000    // how long to wait for time() to become sane
@@ -70,11 +62,7 @@
 // Buzzer (passive, driven via ledc/tone -- never a delay()-blocking tone)
 #define BUZZER_PIN   6
 
-// Anti-brute-force lockout: after this many consecutive DENIED badges
-// (unknown UID or expired -- NOT admin/granted, which resets the
-// counter), the reader stops accepting cards for LOCKOUT_DURATION_MS.
-// Does not affect the serial/CLI link, which stays fully usable during
-// a lockout (e.g. to inspect the database or add the legitimate badge
-// that was being rejected).
+// Anti-brute-force: consecutive denied badges → lockout.
+// Serial/CLI still works during lockout.
 #define MAX_CONSECUTIVE_DENIALS   5
 #define LOCKOUT_DURATION_MS       (30UL * 1000UL)   // 30s
