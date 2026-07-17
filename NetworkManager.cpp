@@ -2,14 +2,14 @@
 #include "Config.h"
 #include <WiFi.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
 
 namespace {
   const char* kPrefsNamespace = "wifi";
   const char* kKeySsid = "ssid";
   const char* kKeyPass = "pass";
-  // Timezone is stored in the same NVS namespace as the Wi-Fi credentials
-  // -- both are "provisioned at runtime, persist across reboots" settings
-  // owned by WifiTimeManager, so there's no reason to split them out.
+  // Timezone lives in the same NVS namespace as the Wi-Fi creds: both are
+  // runtime-provisioned settings owned by WifiTimeManager.
   const char* kKeyGmtOffset = "gmt_off";
   const char* kKeyDstOffset = "dst_off";
   const char* kKeyTzSet     = "tz_set";   // "1" once configure_timezone has run
@@ -39,8 +39,6 @@ void WifiTimeManager::loadTimezone_() {
     gmtOffsetSec_ = prefs.getLong(kKeyGmtOffset, NTP_GMT_OFFSET_SEC);
     daylightOffsetSec_ = prefs.getInt(kKeyDstOffset, NTP_DAYLIGHT_OFFSET_SEC);
   } else {
-    // Never configured via 'configure_timezone' -- fall back to the
-    // compile-time default in Config.h.
     gmtOffsetSec_ = NTP_GMT_OFFSET_SEC;
     daylightOffsetSec_ = NTP_DAYLIGHT_OFFSET_SEC;
   }
@@ -63,18 +61,15 @@ bool WifiTimeManager::setTimezone(long gmtOffsetSec, int daylightOffsetSec) {
   daylightOffsetSec_ = daylightOffsetSec;
 
   if (!isWifiConnected()) {
-    // No network yet to verify against an NTP server -- still accept and
-    // persist it; it'll be applied on the next successful sync (boot or
-    // reconnect). resyncTime()/isWifiConnected() checks already fail
-    // safely elsewhere when there's no time sync.
+    // No network to verify against NTP yet -- persist anyway, applied on
+    // next successful sync.
     saveTimezone_(gmtOffsetSec_, daylightOffsetSec_);
     return true;
   }
 
   if (!syncTimeBlocking_(NTP_SYNC_TIMEOUT_MS)) {
-    // Roll back in RAM so a bad offset (e.g. unreachable NTP right now)
-    // doesn't leave isUserExpired_() computing against a half-applied
-    // value until the caller retries.
+    // Roll back in RAM so a bad offset doesn't leave isUserExpired_()
+    // computing against a half-applied value until the caller retries.
     gmtOffsetSec_ = oldGmt;
     daylightOffsetSec_ = oldDst;
     return false;
@@ -91,6 +86,9 @@ bool WifiTimeManager::connectBlocking_(const String& ssid, const String& passwor
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
     delay(100);
+    // Required: this loop runs after loopTask is subscribed to the TWDT.
+    // Missing reset here was the actual cause of the boot-time panic.
+    esp_task_wdt_reset();
   }
   return WiFi.status() == WL_CONNECTED;
 }
@@ -101,6 +99,7 @@ bool WifiTimeManager::syncTimeBlocking_(uint32_t timeoutMs) {
   time_t now = time(nullptr);
   while (now < 1600000000 && (millis() - start) < timeoutMs) {
     delay(100);
+    esp_task_wdt_reset();  // same TWDT requirement as connectBlocking_
     now = time(nullptr);
   }
   lastSyncAttemptMs_ = millis();
@@ -130,6 +129,12 @@ bool WifiTimeManager::configure(const String& ssid, const String& password) {
 void WifiTimeManager::update() {
   if (!isWifiConnected()) return;
   if (millis() - lastSyncAttemptMs_ < NTP_RESYNC_INTERVAL_MS) return;
+  if (importActive_) {
+    // syncTimeBlocking_() can block serial up to 8s, blowing the CLI's
+    // retry budget -- defer resync until import finishes.
+    lastSyncAttemptMs_ = millis();
+    return;
+  }
   syncTimeBlocking_(NTP_SYNC_TIMEOUT_MS);
 }
 
@@ -143,7 +148,6 @@ time_t WifiTimeManager::nowUtc() const {
 }
 
 String WifiTimeManager::currentSsid() const {
-  // WiFi.SSID() returns "" if not connected. Cheap, non-blocking.
   if (!isWifiConnected()) return String("");
   return WiFi.SSID();
 }
