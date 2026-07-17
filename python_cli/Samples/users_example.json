@@ -1,0 +1,30 @@
+[
+  {
+    "uid": "04A1B2C3",
+    "name": "Alice Martin",
+    "registered": "2026-01-15",
+    "valid_days": 365
+  },
+  {
+    "uid": "04D4E5F6",
+    "name": "Bruno Petit",
+    "registered": "2026-02-01",
+    "valid_days": 180
+  },
+  {
+    "uid": "0A1B2C3D",
+    "name": "Chloe Dubois",
+    "registered": "2026-03-10",
+    "valid_days": 90
+  },
+  {
+    "uid": "0E4F5061",
+    "name": "David Leroy",
+    "registered": "2026-01-20",
+    "valid_days": 30
+  },
+  {
+    "uid": "12345678",
+    "name": "Admin Garage"
+  }
+]
