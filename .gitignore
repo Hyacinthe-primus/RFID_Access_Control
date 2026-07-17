@@ -1,5 +1,13 @@
 __pycache__/
+python_cli/backups/
+python_cli/Usersdata/
+.pytest_cache/
+.vscode/
+wiki/
+
 *.pyc
 *.pyo
 *.pyd
-python_cli/backups/
+*.bin
+
+MIGRATION_NOTES.md
