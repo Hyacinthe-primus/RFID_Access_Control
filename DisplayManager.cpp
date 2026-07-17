@@ -1,7 +1,3 @@
-/*
- * DisplayManager.cpp
- */
-
 #include "DisplayManager.h"
 #include <Wire.h>
 
