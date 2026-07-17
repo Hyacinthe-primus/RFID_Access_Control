@@ -1,13 +1,7 @@
-"""
-database.py
-The ESP32 is the source of truth for the user database -- this module does
-NOT maintain a persistent local copy. It exists to give the rest of the CLI
-a typed, validated view of what the device just told us, rather than
-passing raw dicts around.
-"""
+"""Typed, validated views of device responses. No local persistent copy."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 
 # Sentinel value used by the firmware to mark "admin" badges that never
@@ -29,13 +23,7 @@ class User:
 
     @property
     def is_admin(self) -> bool:
-        """An admin badge has no registration date and never expires.
-
-        The firmware stores admins with `registered=""` and
-        `valid_days=-1`; older firmwares that pre-date the admin feature
-        always have a real date and a non-negative number of days, so this
-        detection is backward-compatible with any existing database.
-        """
+        """Admin if no registered date or valid_days=-1."""
         return self.registered == ADMIN_REGISTERED or self.valid_days == ADMIN_VALID_DAYS
 
 
@@ -107,10 +95,48 @@ def parse_net_status(response: Dict[str, Any]) -> NetworkStatus:
         raise DatabaseResponseError(f"Malformed net_status response: {exc}")
 
 
+def parse_find_result(response: Dict[str, Any]) -> User:
+    """Parse single-UID find response. Raises on miss."""
+    if response.get("status") != "ok":
+        raise DatabaseResponseError(response.get("message", "Unknown error"))
+    try:
+        return User(
+            uid=response["uid"],
+            name=response["name"],
+            registered=response.get("registered", "?"),
+            valid_days=response.get("valid_days", 0),
+        )
+    except KeyError as exc:
+        raise DatabaseResponseError(f"Response missing field: {exc}")
+
+
+@dataclass(frozen=True)
+class FailedEntry:
+    uid: str
+    message: str
+
+
+def parse_batch_add_result(response: Dict[str, Any]) -> Tuple[int, int, List[FailedEntry]]:
+    """Parse batch_add response. Raises on call-level error only."""
+    if response.get("status") != "ok":
+        raise DatabaseResponseError(response.get("message", "Unknown error"))
+    try:
+        added = int(response["added"])
+        errors = int(response["errors"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatabaseResponseError(f"Malformed batch_add_result response: {exc}")
+
+    failed: List[FailedEntry] = []
+    for entry in response.get("failed", []):
+        try:
+            failed.append(FailedEntry(uid=entry["uid"], message=entry.get("message", "unknown error")))
+        except (KeyError, TypeError):
+            continue  # skip malformed entries rather than crashing the CLI
+    return added, errors, failed
+
+
 def expiration_date_str(user: User) -> str:
-    """Best-effort human-readable expiration date for display purposes only
-    (the ESP32 is always the authority on whether a badge is actually
-    expired, using its own NTP-synced clock)."""
+    """Human-readable expiration date (display only, device is authority)."""
     if user.is_admin:
         return "ADMIN (no expiry)"
 
@@ -128,3 +154,30 @@ def require_ok(response: Dict[str, Any]) -> None:
     """Raise DatabaseResponseError if the device reported an error."""
     if response.get("status") != "ok":
         raise DatabaseResponseError(response.get("message", "Unknown error"))
+
+
+@dataclass(frozen=True)
+class SyncResult:
+    removed: int
+    added: int
+    replaced: int
+    errors: int
+    db_crc32: int
+
+
+def parse_sync_result(response: Dict[str, Any]) -> SyncResult:
+    """Parse the final sync_result response. Raises on call-level error
+    (status != ok) -- per-op errors are reported via the `errors` field,
+    which does not raise."""
+    if response.get("status") != "ok":
+        raise DatabaseResponseError(response.get("message", "Unknown error"))
+    try:
+        return SyncResult(
+            removed=int(response["removed"]),
+            added=int(response["added"]),
+            replaced=int(response["replaced"]),
+            errors=int(response["errors"]),
+            db_crc32=int(response["db_crc32"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatabaseResponseError(f"Malformed sync_result response: {exc}")
