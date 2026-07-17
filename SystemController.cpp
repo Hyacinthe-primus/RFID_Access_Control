@@ -1,17 +1,16 @@
-/*
- * SystemController.cpp
- */
-
 #include "SystemController.h"
 #include "Config.h"
+#include "ImportProfiler.h"
 #include <cstring>
 #include <time.h>
 #include <esp_heap_caps.h>
+#include <esp_task_wdt.h>
+#include <vector>
+#include <utility>
+#include <algorithm>
 
 namespace {
-  // Formats a time_t (epoch seconds) into "YYYY-MM-DD HH:MM:SS" in local
-  // time.  ESP32's newlib does NOT provide strftime(), so we use localtime()
-  // and manual formatting instead.
+  // ESP32 newlib has no strftime() -- localtime() + manual formatting.
   String formatLocalTime(time_t epoch) {
     struct tm* t = localtime(&epoch);
     if (!t) return String("??");
@@ -22,24 +21,19 @@ namespace {
     return String(buf);
   }
 
-  // Portable conversion of a calendar date to UTC epoch seconds.
-  // ESP32's newlib does NOT provide timegm(), so we use Howard Hinnant's
-  // civil-calendar-to-days algorithm instead -- no libc time conversion
-  // needed, works identically on AVR, ESP32, ARM, etc.
+  // ESP32 newlib has no timegm() -- Howard Hinnant's civil-calendar
+  // algorithm instead. Portable, no libc time conversion needed.
   time_t civilDateToEpoch(int year, int month, int day) {
-    // Shift March-based year so that the leap-day rule is simplified
     if (month <= 2) { year--; month += 12; }
-    // Days from 1970-01-01 using the Gregorian calendar algorithm
     int era = (year >= 0 ? year : year - 399) / 400;
-    unsigned yoe = static_cast<unsigned>(year - era * 400);       // year within era  [0, 399]
+    unsigned yoe = static_cast<unsigned>(year - era * 400);
     unsigned doy = (153u * (static_cast<unsigned>(month) - 3u) + 2u) / 5u + static_cast<unsigned>(day) - 1u;
-    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;     // day-of-era       [0, 146096]
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
     int days = static_cast<int>(era * 146097) + static_cast<int>(doe) - 719468;
     return static_cast<time_t>(days) * 86400LL;
   }
 
-  // Parses a "YYYY-MM-DD" string (already format-validated by
-  // DatabaseManager::isValidRegisteredDate) into UTC midnight epoch seconds.
+  // Input is pre-validated by DatabaseManager::isValidRegisteredDate.
   time_t parseRegisteredDateUtc(const String& registered) {
     int year  = registered.substring(0, 4).toInt();
     int month = registered.substring(5, 7).toInt();
@@ -49,32 +43,44 @@ namespace {
 }
 
 void SystemController::begin() {
+  // Sized from kLineBufCapacity so the two can't drift apart.
+  Serial.setRxBufferSize(SerialProtocol::kLineBufCapacity);
   Serial.begin(SERIAL_BAUD);
   uint32_t waitStart = millis();
   while (!Serial && (millis() - waitStart) < 3000) { /* wait briefly for native USB CDC */ }
 
+  Serial.println(F("[boot] display_.begin() ...")); Serial.flush();
   display_.begin();
+  Serial.println(F("[boot] display_.begin() OK")); Serial.flush();
+
   enterState_(SystemState::BOOT);
   display_.showBoot();
 
+  Serial.println(F("[boot] db_.begin() ...")); Serial.flush();
   if (!db_.begin()) {
     display_.showError("DB INIT FAIL");
   }
+  Serial.println(F("[boot] db_.begin() OK")); Serial.flush();
 
+  Serial.println(F("[boot] rfid_.begin() ...")); Serial.flush();
   bool rfidOk = rfid_.begin();
   if (!rfidOk) {
     display_.showError("PN532 NOT FOUND");
   }
+  Serial.println(F("[boot] rfid_.begin() OK")); Serial.flush();
 
+  Serial.println(F("[boot] buzzer_.begin() ...")); Serial.flush();
   buzzer_.begin();
+  Serial.println(F("[boot] buzzer_.begin() OK")); Serial.flush();
 
-  // Blocking (bounded by WIFI_CONNECT_TIMEOUT_MS/NTP_SYNC_TIMEOUT_MS), same
-  // one-off pattern as the rest of begin(). If no credentials are stored
-  // yet, or the connect/sync fails, we keep going: badges will simply be
-  // reported as expired (fail safe) until 'configure_wifi' succeeds.
+  // Blocking but bounded. No credentials = badges fail-safe as expired.
+  Serial.println(F("[boot] network_.begin() ...")); Serial.flush();
   network_.begin();
+  Serial.println(F("[boot] network_.begin() OK")); Serial.flush();
 
+  Serial.println(F("[boot] serial_.begin() ...")); Serial.flush();
   serial_.begin([this](JsonDocument& doc) { handleSerialMessage_(doc); });
+  Serial.println(F("[boot] serial_.begin() OK")); Serial.flush();
 
   serialWasConnected_ = (bool)Serial;
 
@@ -106,19 +112,17 @@ void SystemController::restoreIdleOrScanScreen_() {
 }
 
 void SystemController::update() {
-  // 1. Always service the serial link, regardless of state, so 'add'/
-  //    'remove'/'rename'/'list'/'scan' commands are never dropped even
-  //    while a result screen is being shown.
+  // Serviced every tick regardless of state so CLI commands are never
+  // dropped while a result screen is showing.
   serial_.poll();
   handleSerialConnectionChange_();
   buzzer_.update();
-  network_.update(); // non-blocking check; only re-syncs every NTP_RESYNC_INTERVAL_MS
+  network_.update(); // non-blocking; only re-syncs every NTP_RESYNC_INTERVAL_MS
 
   uint32_t now = millis();
 
   switch (state_) {
     case SystemState::BOOT:
-      // begin() moves us out of BOOT synchronously; nothing to do here.
       break;
 
     case SystemState::IDLE:
@@ -133,8 +137,8 @@ void SystemController::update() {
     case SystemState::RESULT_DISPLAY:
       if (now - stateEnteredMs_ >= RESULT_DISPLAY_MS) {
         if (renewalActive_) {
-          // In renewal mode, skip UID screen — go straight back to
-          // "RENEWING NFC TAG" so the operator can present the next card.
+          // Renewal mode skips the UID screen -- straight back to
+          // "RENEWING NFC TAG" for the next card.
           restoreIdleOrScanScreen_();
           enterState_(state_);
         } else {
@@ -152,16 +156,10 @@ void SystemController::update() {
       break;
 
     case SystemState::DB_BUSY:
-      // Only reached transiently inside withDbBusyScreen_; update() should
-      // never observe this state because that helper is synchronous.
-      break;
+      break;  // transient -- withDbBusyScreen_ is synchronous
 
     case SystemState::LOCKOUT:
-      // Deliberately does NOT poll rfid_ here -- cards presented during a
-      // lockout are ignored entirely, not just denied (denying them would
-      // just restart the same cooldown pointlessly). Serial/CLI commands
-      // keep working as normal via serial_.poll() above, so an operator
-      // can still investigate or fix the database during a lockout.
+      // No RFID polling here -- serial/CLI still work for investigation.
       if (now - stateEnteredMs_ >= LOCKOUT_DURATION_MS) {
         consecutiveDenials_ = 0;
         lockoutLastShownSec_ = -1;
@@ -180,39 +178,29 @@ void SystemController::update() {
 bool SystemController::isUserExpired_(const UserRecord& user, bool& timeAvailableOut) const {
   timeAvailableOut = network_.isTimeSynced();
 
-  // Admin badges never expire, regardless of NTP state. This is the whole
-  // point of the admin shortcut: an admin card always grants access even
-  // if the device's clock has not been synced yet (which would otherwise
-  // fail safe to "denied" for normal badges).
   if (user.isAdmin()) {
     return false;
   }
 
   if (!timeAvailableOut) {
-    // Fail safe: without a trustworthy clock we cannot evaluate
-    // "current_date_time <= expiration_date", so treat as expired.
+    // Fail safe: no trustworthy clock, can't evaluate expiration -- deny.
     return true;
   }
 
-  // 'registered' is a bare calendar date with no timezone info -- it's
-  // interpreted in the device's currently configured timezone (runtime
-  // value in WifiTimeManager, settable via the 'configure_timezone' serial
-  // command / `cli.py timezone`, defaulting to Config.h's NTP_GMT_OFFSET_SEC/
-  // NTP_DAYLIGHT_OFFSET_SEC until then), which must match the timezone of
-  // the machine running the Python CLI for this to line up correctly.
+  // registered is a bare date interpreted in the device's configured
+  // timezone; must match the CLI machine's timezone.
   time_t registeredEpoch = parseRegisteredDateUtc(user.registered);
   double expirationEpoch = (double)registeredEpoch + user.validDays * 86400.0;
   double currentLocalEpoch = (double)network_.nowUtc() + network_.gmtOffsetSec() + network_.daylightOffsetSec();
   // nowUtc() returns raw UTC; configTime() only affects localtime(), not
-  // time(NULL), so the manual addition here is correct and NOT a double count.
+  // time(NULL) -- this manual addition is correct, not a double count.
 
-  return currentLocalEpoch > expirationEpoch; // expired if current > expiration
+  return currentLocalEpoch > expirationEpoch;
 }
 
 void SystemController::handleCardDetected_(const String& uid) {
   if (scanModeActive_) {
-    // Scan mode: report the UID, do NOT check it against the database,
-    // then automatically fall back to normal operation.
+    // Report the UID without checking it against the DB, then fall back.
     serial_.sendUidDetected(uid);
     scanModeActive_ = false;
     enterState_(SystemState::IDLE);
@@ -221,12 +209,9 @@ void SystemController::handleCardDetected_(const String& uid) {
   }
 
   if (renewalActive_) {
-    // Renewal mode: look up the UID, update registered + valid_days,
-    // report the result, then return to renewal mode.
     UserRecord user;
     bool found = db_.findUser(uid, user);
     if (found) {
-      // Get today's date via NTP-synced clock
       time_t now = network_.nowUtc() + network_.gmtOffsetSec() + network_.daylightOffsetSec();
       struct tm* t = localtime(&now);
       char todayBuf[11];
@@ -239,7 +224,7 @@ void SystemController::handleCardDetected_(const String& uid) {
       if (ok) {
         db_.findUser(uid, user);
         serial_.sendRenewalResult(uid, user.name, user.registered, user.validDays);
-        display_.showAccessGranted("RENEWED " + user.name);
+        display_.showAccessGranted("RENEWED " + String(user.name));
         buzzer_.playGranted();
       } else {
         serial_.sendError(err);
@@ -264,7 +249,7 @@ void SystemController::handleCardDetected_(const String& uid) {
 
   pendingAccessGranted_ = granted;
   pendingUid_ = uid;
-  pendingName_ = granted ? user.name : String("");
+  pendingName_ = granted ? String(user.name) : String("");
 
   if (granted) {
     consecutiveDenials_ = 0;
@@ -285,7 +270,7 @@ void SystemController::handleCardDetected_(const String& uid) {
 
   consecutiveDenials_++;
   if (consecutiveDenials_ >= MAX_CONSECUTIVE_DENIALS) {
-    consecutiveDenials_ = 0;      // fresh count for after the lockout lifts
+    consecutiveDenials_ = 0;
     lockoutLastShownSec_ = -1;
     enterState_(SystemState::LOCKOUT);
     display_.showLockout(LOCKOUT_DURATION_MS / 1000);
@@ -305,20 +290,13 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
     String uid = String((const char*)doc["uid"]);
     String name = String((const char*)doc["name"]);
 
-    // --- Admin vs normal badge detection --------------------------------
-    // The Python CLI sends an ADMIN add as `{"type":"add","uid":...,"name":...}`
-    // with NO 'registered' and NO 'valid_days' fields. When either field is
-    // missing we substitute the admin sentinels (empty registered, -1 days),
-    // which the DatabaseManager validators accept and which `UserRecord::isAdmin()`
-    // later recognises. A normal badge still sends both fields as before.
-    // ---------------------------------------------------------------------
-    
+    // Admin if registered/valid_days fields are missing (see DatabaseManager.h).
     String registered;
     double validDays;
     bool adminBadge = !doc.containsKey("registered") || !doc.containsKey("valid_days");
     if (adminBadge) {
-      registered = String(ADMIN_REGISTERED);   // ""
-      validDays = ADMIN_VALID_DAYS;             // -1.0
+      registered = String(ADMIN_REGISTERED);
+      validDays = ADMIN_VALID_DAYS;
     } else {
       registered = String((const char*)doc["registered"]);
       validDays = doc["valid_days"].as<double>();
@@ -327,11 +305,7 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
     String err;
     bool ok;
     if (db_.isImportMode()) {
-      // Batch import: the "DATABASE UPDATING" screen is shown once by
-      // import_begin and restored once by import_end. Do NOT churn the
-      // I2C LCD on every single add -- at ~1500 users that's 1500x2
-      // full-screen refreshes for nothing, and I2C writes are slow
-      // (multiple ms per transaction).
+      // LCD held by import_begin/import_end -- don't churn per-add.
       ok = db_.addUserNoSave(uid, name, registered, validDays, err);
     } else {
       ok = withDbBusyScreen_([&]() {
@@ -339,6 +313,121 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
       });
     }
     if (ok) serial_.sendOk(); else serial_.sendError(err);
+    return;
+  }
+
+  if (strcmp(type, "batch_add") == 0) {
+    if (!db_.isImportMode()) {
+      serial_.sendError("batch_add requires import_begin first");
+      return;
+    }
+    if (!doc.containsKey("users") || !doc["users"].is<JsonArray>()) {
+      serial_.sendError("Missing or invalid 'users' array");
+      return;
+    }
+    JsonArray arr = doc["users"].as<JsonArray>();
+    size_t added = 0;
+    size_t errors = 0;
+    std::vector<std::pair<String, String>> failed;
+    {
+      ScopedMicroTimer t(g_importProfile.batchLoopUs);
+      for (JsonObject entry : arr) {
+        if (!entry.containsKey("uid") || !entry.containsKey("name")) {
+          errors++;
+          String uid = entry.containsKey("uid") ? String((const char*)entry["uid"]) : String("");
+          failed.push_back({uid, "Missing 'uid' or 'name'"});
+          continue;
+        }
+        String uid = String((const char*)entry["uid"]);
+        String name = String((const char*)entry["name"]);
+
+        String registered;
+        double validDays;
+        bool adminBadge = !entry.containsKey("registered") || !entry.containsKey("valid_days");
+        if (adminBadge) {
+          registered = String(ADMIN_REGISTERED);
+          validDays = ADMIN_VALID_DAYS;
+        } else {
+          registered = String((const char*)entry["registered"]);
+          validDays = entry["valid_days"].as<double>();
+        }
+
+        String err;
+        bool ok = db_.addUserNoSave(uid, name, registered, validDays, err);
+        if (ok) {
+          added++;
+        } else {
+          errors++;
+          failed.push_back({uid, err});
+        }
+      }
+    }
+    g_importProfile.batchCount++;
+    g_importProfile.userCount += arr.size();
+    {
+      ScopedMicroTimer t(g_importProfile.ackSerializeUs);
+      serial_.sendBatchAddResult(added, errors, failed);
+    }
+    return;
+  }
+
+  if (strcmp(type, "import_bin") == 0) {
+    if (!db_.isImportMode()) {
+      serial_.sendError("import_bin requires import_begin first");
+      return;
+    }
+    if (!doc.containsKey("bytes")) {
+      serial_.sendError("Missing 'bytes'");
+      return;
+    }
+    long totalBytesSigned = doc["bytes"].as<long>();
+    size_t recSize = DatabaseManager::recordSize();
+    if (totalBytesSigned < 0 || ((size_t)totalBytesSigned % recSize) != 0) {
+      serial_.sendError("'bytes' must be a non-negative multiple of the record size");
+      return;
+    }
+    size_t totalBytes = (size_t)totalBytesSigned;
+    size_t incomingUsers = totalBytes / recSize;
+
+    // Pre-check free PSRAM to avoid StoreProhibited on large imports.
+    size_t roughNeededBytes = incomingUsers * sizeof(UserRecord);
+    size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (roughNeededBytes + 8192 > freePsram) {  // +8192 matches the chunk buffer below
+      serial_.sendError("Not enough free PSRAM for an import this size");
+      return;
+    }
+    db_.reserveForImport(incomingUsers);
+
+    serial_.sendOk();  // ack signals host to start writing raw bytes
+
+    const size_t kChunkBytes = (recSize <= 8192) ? (8192 / recSize) * recSize : recSize;
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(kChunkBytes, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+      serial_.sendError("Out of memory for import_bin buffer");
+      return;
+    }
+
+    size_t added = 0, errors = 0, consumed = 0;
+    unsigned long perChunkTimeoutMs = 5000;  // stall detector, not a flat budget
+    bool desynced = false;
+
+    while (consumed < totalBytes) {
+      size_t want = std::min(kChunkBytes, totalBytes - consumed);
+      size_t got = serial_.readRawExact(buf, want, perChunkTimeoutMs);
+      if (got < want) { desynced = true; break; }
+      for (size_t off = 0; off < got; off += recSize) {
+        String err;
+        if (db_.addUserFromRawRecord(&buf[off], err)) added++; else errors++;
+      }
+      consumed += got;
+    }
+    heap_caps_free(buf);
+
+    if (desynced) {
+      serial_.sendError("import_bin: transfer stalled/incomplete -- reconnect and retry the import");
+      return;
+    }
+    serial_.sendImportBinResult(added, errors);
     return;
   }
 
@@ -355,11 +444,6 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
   }
 
   if (strcmp(type, "clear_all") == 0) {
-    // Wipes every user from the device database. The CLI's `remove --force`
-    // command sends this. No UID required -- the entire users_ vector is
-    // emptied and persisted atomically (DatabaseManager::clearAll rolls
-    // back in RAM if the LittleFS write fails, so a power loss mid-write
-    // never leaves a half-empty DB on disk).
     String err;
     bool ok = withDbBusyScreen_([&]() { return db_.clearAll(err); });
     if (ok) serial_.sendOk(); else serial_.sendError(err);
@@ -367,12 +451,6 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
   }
 
   if (strcmp(type, "remove_all_except") == 0) {
-    // Deletes every user NOT in the given 'uids' array. The CLI's
-    // `remove --except UID1,UID2,...` command sends this. We require a
-    // JSON array with at least one entry -- an empty/missing list is
-    // rejected here (and again in DatabaseManager) rather than treated as
-    // "keep nothing", since that would just be clear_all wearing a
-    // different name and callers should say that explicitly instead.
     if (!doc.containsKey("uids") || !doc["uids"].is<JsonArray>()) {
       serial_.sendError("Missing or invalid 'uids' array");
       return;
@@ -408,23 +486,260 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
     return;
   }
 
+  if (strcmp(type, "find") == 0) {
+    if (!doc.containsKey("uid")) {
+      serial_.sendError("Missing 'uid'");
+      return;
+    }
+    String uid = String((const char*)doc["uid"]);
+    UserRecord user;
+    uint32_t searchStart = micros();
+    bool found = db_.findUser(uid, user);
+    uint32_t searchUs = micros() - searchStart;
+    serial_.sendFindResult(found, uid, found ? String(user.name) : String(""),
+                           found ? String(user.registered) : String(""),
+                           found ? user.validDays : 0.0, searchUs);
+    return;
+  }
+
+  if (strcmp(type, "find_name") == 0) {
+    if (!doc.containsKey("query")) {
+      serial_.sendError("Missing 'query'");
+      return;
+    }
+    String query = String((const char*)doc["query"]);
+    query.toLowerCase();
+    serial_.sendFindNameResult(db_, query);
+    return;
+  }
+
   if (strcmp(type, "list") == 0) {
-    // Read-only, in-RAM -- no need to pause RFID scanning for this one.
     serial_.sendUserList(db_);
     return;
   }
 
+  if (strcmp(type, "export_bin") == 0) {
+    size_t count = db_.userCount();
+    size_t recSize = DatabaseManager::recordSize();
+    size_t totalBytes = count * recSize;
+    serial_.sendExportBinHeader(totalBytes, count);
+
+    // Encode+flush in chunks rather than one Serial.write() per user --
+    // same fixed-per-call-overhead lesson as DatabaseManager::save().
+    static const size_t kRecordsPerFlush = 8192 / DatabaseManager::recordSize();
+    static const size_t kChunkBytes = kRecordsPerFlush * DatabaseManager::recordSize();
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(kChunkBytes, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+      // Can't sendError() after the header's already gone out -- send
+      // zeros so the byte count matches; host CRC32 catches the corruption.
+      for (size_t sent = 0; sent < totalBytes; ) {
+        uint8_t zero[64] = {0};
+        size_t n = std::min(sizeof(zero), totalBytes - sent);
+        serial_.writeRaw(zero, n);
+        sent += n;
+        if ((sent & 0xFFFF) < sizeof(zero)) {
+          esp_task_wdt_reset();
+        }
+      }
+      return;
+    }
+    size_t bufLen = 0;
+    for (size_t i = 0; i < count; i++) {
+      db_.encodeUserAt(i, &buf[bufLen]);
+      bufLen += recSize;
+      if (bufLen + recSize > kChunkBytes) {
+        serial_.writeRaw(buf, bufLen);
+        bufLen = 0;
+      }
+      // A full export at USB-CDC speeds can outrun the TWDT timeout --
+      // writeRaw()/Serial.write() doesn't feed the watchdog on its own.
+      if ((i & 0xFF) == 0xFF) {
+        esp_task_wdt_reset();
+      }
+    }
+    if (bufLen > 0) serial_.writeRaw(buf, bufLen);
+    heap_caps_free(buf);
+    return;
+  }
+
+  if (strcmp(type, "sync_begin") == 0) {
+    // Stateless query, same shape as "status" -- the device isn't left
+    // "waiting" for anything after this reply, so there's nothing to time
+    // out if the host never follows up (e.g. crc already matched locally).
+    serial_.sendSyncBeginResult(db_);
+    return;
+  }
+
+  if (strcmp(type, "sync_manifest") == 0) {
+    size_t count = db_.userCount();
+    size_t entrySize = DatabaseManager::manifestEntrySize();
+    size_t totalBytes = count * entrySize;
+    serial_.sendSyncManifestHeader(totalBytes, count);
+
+    static const size_t kEntriesPerFlush = 8192 / DatabaseManager::manifestEntrySize();
+    static const size_t kChunkBytes = kEntriesPerFlush * DatabaseManager::manifestEntrySize();
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(kChunkBytes, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+      // Header already went out -- send zeros so the byte count still
+      // matches; the host's manifest parse will simply see all-zero uids,
+      // which won't match anything real and forces a safe re-sync.
+      for (size_t sent = 0; sent < totalBytes; ) {
+        uint8_t zero[64] = {0};
+        size_t n = std::min(sizeof(zero), totalBytes - sent);
+        serial_.writeRaw(zero, n);
+        sent += n;
+        if ((sent & 0xFFFF) < sizeof(zero)) esp_task_wdt_reset();
+      }
+      return;
+    }
+    size_t bufLen = 0;
+    for (size_t i = 0; i < count; i++) {
+      db_.encodeManifestEntryAt(i, &buf[bufLen]);
+      bufLen += entrySize;
+      if (bufLen + entrySize > kChunkBytes) {
+        serial_.writeRaw(buf, bufLen);
+        bufLen = 0;
+      }
+      if ((i & 0xFF) == 0xFF) esp_task_wdt_reset();
+    }
+    if (bufLen > 0) serial_.writeRaw(buf, bufLen);
+    heap_caps_free(buf);
+    return;
+  }
+
+  if (strcmp(type, "sync_apply") == 0) {
+    if (!doc.containsKey("remove") || !doc.containsKey("add") || !doc.containsKey("replace")) {
+      serial_.sendError("Missing 'remove', 'add', or 'replace'");
+      return;
+    }
+    long removeSigned = doc["remove"].as<long>();
+    long addSigned = doc["add"].as<long>();
+    long replaceSigned = doc["replace"].as<long>();
+    if (removeSigned < 0 || addSigned < 0 || replaceSigned < 0) {
+      serial_.sendError("'remove'/'add'/'replace' must be non-negative");
+      return;
+    }
+    size_t removeCount = (size_t)removeSigned;
+    size_t addCount = (size_t)addSigned;
+    size_t replaceCount = (size_t)replaceSigned;
+
+    size_t recSize = DatabaseManager::recordSize();
+    size_t uidEntrySz = DatabaseManager::uidEntrySize();
+    size_t removeBytes = removeCount * uidEntrySz;
+    size_t addBytes = addCount * recSize;
+    size_t replaceBytes = replaceCount * recSize;
+
+    // Pre-check free PSRAM for the net growth, same guard as import_bin.
+    size_t roughNeededBytes = (addCount > removeCount ? (addCount - removeCount) : 0) * sizeof(UserRecord);
+    size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (roughNeededBytes + 8192 > freePsram) {
+      serial_.sendError("Not enough free PSRAM for a sync this size");
+      return;
+    }
+    db_.reserveForImport(addCount);
+
+    serial_.sendOk();  // ack signals host to start streaming raw bytes
+
+    size_t chunkCap = 8192;
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(chunkCap, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+      serial_.sendError("Out of memory for sync_apply buffer");
+      return;
+    }
+    struct BufGuard { uint8_t* p; ~BufGuard() { if (p) heap_caps_free(p); } } bufGuard{buf};
+
+    size_t removed = 0, added = 0, replaced = 0, errors = 0;
+    unsigned long perChunkTimeoutMs = 5000;  // stall detector, not a flat budget
+    bool desynced = false;
+    String lastErr;
+
+    // Phase 1: removes. beginRemoveBatch()/endRemoveBatch() turn this into
+    // mark-then-compact-once (O(n) total) instead of one erase() per uid
+    // (O(n) each, O(n^2) total) -- the erase()-per-call version is what
+    // was slow enough to starve the watchdog on a large diff.
+    db_.beginRemoveBatch();
+    size_t removeOps = 0;
+    for (size_t consumed = 0; consumed < removeBytes && !desynced; ) {
+      size_t want = std::min(chunkCap - (chunkCap % uidEntrySz), removeBytes - consumed);
+      size_t got = serial_.readRawExact(buf, want, perChunkTimeoutMs);
+      if (got < want) { desynced = true; break; }
+      for (size_t off = 0; off < got; off += uidEntrySz) {
+        String err;
+        if (db_.removeUserRawNoSave(&buf[off], err)) removed++; else { errors++; lastErr = err; }
+        if ((++removeOps & 0xFF) == 0xFF) esp_task_wdt_reset();
+      }
+      consumed += got;
+    }
+    db_.endRemoveBatch();
+
+    // Phase 2: adds. Reuses the same unsorted-append-then-resort-once
+    // strategy as import_bin (db_.addUserFromRawRecord() + setImportMode())
+    // instead of a sorted vector::insert() per record. Baseline for the
+    // dup-check is everything already in users_ at this point -- i.e. the
+    // post-remove state -- exactly like import_begin's baseline is
+    // "whatever was loaded from flash".
+    db_.setImportMode(true);
+    for (size_t consumed = 0; !desynced && consumed < addBytes; ) {
+      size_t want = std::min(chunkCap - (chunkCap % recSize), addBytes - consumed);
+      size_t got = serial_.readRawExact(buf, want, perChunkTimeoutMs);
+      if (got < want) { desynced = true; break; }
+      for (size_t off = 0; off < got; off += recSize) {
+        String err;
+        if (db_.addUserFromRawRecord(&buf[off], err)) added++; else { errors++; lastErr = err; }
+        if ((added & 0xFF) == 0xFF) esp_task_wdt_reset();
+      }
+      consumed += got;
+    }
+    // Single O(n log n) resort (mirrors import_end) instead of one O(n)
+    // shift per add. Must happen before Phase 3: replaceUserFromRawRecord()
+    // does a binary search that assumes users_ is sorted, and this also
+    // clears importMode_/importSeen_/importBaselineCount_ on every exit
+    // path (including a desync) so a botched sync can't leave the db in
+    // import mode for whatever command comes next.
+    db_.setImportMode(false);
+
+    // Phase 3: replaces (overwrite in place).
+    for (size_t consumed = 0; !desynced && consumed < replaceBytes; ) {
+      size_t want = std::min(chunkCap - (chunkCap % recSize), replaceBytes - consumed);
+      size_t got = serial_.readRawExact(buf, want, perChunkTimeoutMs);
+      if (got < want) { desynced = true; break; }
+      for (size_t off = 0; off < got; off += recSize) {
+        String err;
+        if (db_.replaceUserFromRawRecord(&buf[off], err)) replaced++; else { errors++; lastErr = err; }
+        if ((replaced & 0xFF) == 0xFF) esp_task_wdt_reset();
+      }
+      consumed += got;
+    }
+
+    if (desynced) {
+      // Transport broke mid-stream -- users_ may hold a partial mix of
+      // ops. Reload from the still-untouched flash file (no save() has
+      // run yet) so the live in-RAM state matches what's actually
+      // persisted, rather than silently diverging from it until reboot.
+      db_.load();
+      serial_.sendError("sync_apply: transfer stalled/incomplete -- reconnect and retry the sync");
+      return;
+    }
+
+    bool ok = withDbBusyScreen_([&]() { return db_.save(); });
+    if (!ok) {
+      // save() failed (verify-by-reread or write error) -- same recovery
+      // as a desync: fall back to whatever is actually on flash.
+      db_.load();
+      serial_.sendSyncResult(false, "Failed to persist database", removed, added, replaced, errors,
+                             db_.computeCrc32());
+      return;
+    }
+    serial_.sendSyncResult(true, "", removed, added, replaced, errors, db_.computeCrc32());
+    return;
+  }
+
   if (strcmp(type, "status") == 0) {
-    // Read-only, in-RAM + a couple of LittleFS syscalls -- no need to
-    // pause RFID scanning for this one.
     serial_.sendStatus(db_);
     return;
   }
 
   if (strcmp(type, "net_status") == 0) {
-    // Read-only snapshot of the current Wi-Fi state. Non-blocking: the
-    // NetworkManager getters just read WiFi.status()/WiFi.SSID()/etc,
-    // they never initiate a reconnect or NTP sync.
     serial_.sendNetStatus(network_);
     return;
   }
@@ -434,8 +749,8 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
       serial_.sendError("NTP time not synced yet");
       return;
     }
-    // configTime() already applied the configured GMT/DST offset so
-    // localtime() returns local time -- do NOT add the offset again.
+    // configTime() already applied the GMT/DST offset, so localtime()
+    // is already local -- do NOT add the offset again here.
     time_t now = network_.nowUtc();
     String formatted = formatLocalTime(now);
     serial_.sendTime(now, formatted);
@@ -459,32 +774,28 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
   }
 
   if (strcmp(type, "import_begin") == 0) {
-    // Enters batch-import mode: subsequent "add" calls insert users into
-    // RAM only, without persisting to flash.  The import is finalized by
-    // "import_end", which writes once.
-    //
-    // The busy screen is shown ONCE here and held for the whole batch --
-    // NOT via withDbBusyScreen_, which would show-then-immediately-restore
-    // it on this single call and leave every subsequent "add" with no
-    // screen state to hold onto.
     state_ = SystemState::DB_BUSY;
     display_.showDatabaseUpdating();
     db_.setImportMode(true);
+    network_.setImportActive(true);
+    g_importProfile.reset();
     serial_.sendOk();
     return;
   }
 
   if (strcmp(type, "import_end") == 0) {
-    // Finalizes a batch import: disables import mode, persists the
-    // in-memory database to flash once, and reports how many users were
-    // added and how many failed validation.
     size_t added = 0;
     size_t errors = 0;
     String err;
     bool ok = withDbBusyScreen_([&]() {
       added = db_.userCount();
       db_.setImportMode(false);
-      bool persisted = db_.save();
+      network_.setImportActive(false);
+      bool persisted;
+      {
+        ScopedMicroTimer t(g_importProfile.saveUs);
+        persisted = db_.save();
+      }
       if (!persisted) {
         err = "Failed to persist database";
         return false;
@@ -492,7 +803,7 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
       return true;
     });
     if (ok) {
-      serial_.sendImportResult(added, errors);
+      serial_.sendImportResult(added, errors, g_importProfile);
     } else {
       serial_.sendError(err);
     }
@@ -522,15 +833,19 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
   }
 
   if (strcmp(type, "enter_scan_mode") == 0) {
-    if (state_ == SystemState::RESULT_DISPLAY || state_ == SystemState::UID_DISPLAY) {
-      // Don't interrupt a result that's still being shown to whoever
-      // just badged in -- scan mode will engage on the next update().
-    }
     if (!renewalActive_) {
       scanModeActive_ = true;
       display_.showScanMode();
     }
     enterState_(SystemState::SCAN_MODE);
+    serial_.sendOk();
+    return;
+  }
+
+  if (strcmp(type, "exit_scan_mode") == 0) {
+    scanModeActive_ = false;
+    enterState_(SystemState::IDLE);
+    display_.showIdle();
     serial_.sendOk();
     return;
   }
@@ -544,13 +859,13 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
     String password = String((const char*)doc["password"]);
 
     SystemState previous = state_;
-    state_ = SystemState::DB_BUSY; // reuses the "block the idle/scan screen" state
+    state_ = SystemState::DB_BUSY; // reuses the "block idle/scan screen" state
     display_.showWifiConnecting();
 
     bool connected = network_.configure(ssid, password);
 
     display_.showWifiResult(connected);
-    delay(1000); // brief, bounded -- lets the operator read the result, same as the boot-screen wait
+    delay(1000); // brief, bounded -- lets the operator read the result
 
     state_ = previous;
     restoreIdleOrScanScreen_();
@@ -570,8 +885,8 @@ void SystemController::handleSerialMessage_(JsonDocument& doc) {
         ? doc["daylight_offset_sec"].as<int>() : 0;
 
     SystemState previous = state_;
-    state_ = SystemState::DB_BUSY; // reuses the "block the idle/scan screen" state
-    display_.showWifiConnecting(); // reuses the "..." busy screen, close enough for a brief blocking op
+    state_ = SystemState::DB_BUSY;
+    display_.showWifiConnecting(); // reused busy screen, close enough for a brief op
 
     bool applied = network_.setTimezone(gmtOffsetSec, daylightOffsetSec);
 
@@ -593,8 +908,7 @@ void SystemController::handleSerialConnectionChange_() {
   if (connected != serialWasConnected_) {
     serialWasConnected_ = connected;
 
-    // Only interrupt the screen if we're in an idle-ish state -- never
-    // stomp on a result the user is currently reading.
+    // Never stomp on a result the user is currently reading.
     if (state_ == SystemState::IDLE || state_ == SystemState::SCAN_MODE) {
       if (connected) display_.showSerialConnected();
       else display_.showSerialDisconnected();
