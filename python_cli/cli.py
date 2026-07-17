@@ -1,56 +1,12 @@
 #!/usr/bin/env python3
-"""
-cli.py
-Entry point for the RFID Access Control management CLI.
+"""RFID Access Control management CLI.
 
-Usage:
-    python cli.py list                                          # list all users
-    python cli.py find --name NAME                              # find users by name (partial match)
-    python cli.py add [--uid UID] [--name NAME] [--valid-days DAYS]
-    python cli.py remove [--uid UID] [--force] [--except UID[,UID,...]]
-    python cli.py rename [--uid UID] [--name NAME]
-    python cli.py scan [--timeout SECONDS] [--infinite]
-    python cli.py status                                        # DB path + LittleFS storage
-    python cli.py netstatus                                     # Wi-Fi state
-    python cli.py ntp-time                                      # device current time
-    python cli.py ntp-sync                                      # force NTP resync
-    python cli.py configure -w SSID -p PASSWORD
-    python cli.py timezone --offset SECONDS [--dst SECONDS]      # set device timezone
-    python cli.py import FILE [--dry-run] [--clear]             # batch import from JSON or CSV
-    python cli.py export FILE                                   # export DB to JSON
-    python cli.py list-ports                                    # list all serial ports
+Serial port auto-detected; use --port to override.
 
-Notes
------
-- `add` without `--valid-days` creates an ADMIN badge: no expiration,
-  always granted regardless of NTP sync state.
-
-- `remove --force` wipes every user from the device in one shot.
-
-- `remove --except UID1,UID2` deletes every user EXCEPT the UID(s) listed.
-  Mutually exclusive with --uid/--force.
-
-- `scan --infinite` keeps scanning cards until Ctrl+C.
-
-- `netstatus` reports Wi-Fi connection state (SSID, IP, signal).
-
-- `import` reads a JSON or CSV file and sends all users in a single batch
-  (one flash write). JSON format matches users.json schema.
-
-- `export` dumps the device DB to a JSON file, useful for backups or
-  round-trip with `import`.
-
-- `ntp-time` shows the device's current local time after NTP sync.
-
-- `ntp-sync` forces an NTP resync on the device.
-
-- `timezone --offset SECONDS` sets and persists the device's GMT offset
-  (e.g. 3600 for UTC+1, -18000 for UTC-5). Optional `--dst SECONDS` adds a
-  daylight-saving offset on top. Persists in NVS and survives reboots --
-  no reflash needed. Must match the timezone of the machine running this
-  CLI (see the 'registered' date docs in README.md).
-
-The serial port is auto-detected; pass --port to override.
+Run with no subcommand (``./cli.py``, optionally with ``--port``) to enter
+the interactive shell. Run with a subcommand (``./cli.py status``) for the
+traditional one-shot scripted behavior -- both modes dispatch to the exact
+same command functions in commands.py.
 """
 
 import argparse
@@ -68,16 +24,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--port", default=None,
-        help="Serial port to use (default: auto-detect)",
+        help="Serial port to use (default: auto-detect). With no subcommand, "
+             "also used to skip auto-detection when entering the shell.",
     )
 
-    sub = parser.add_subparsers(dest="command", required=True)
+    # required=False (not the argparse default) so `./cli.py` with no
+    # subcommand is valid -- it drops into the interactive shell instead of
+    # erroring out. subcommand_names() below is the single place that
+    # introspects this list; nothing else hardcodes it.
+    sub = parser.add_subparsers(dest="command", required=False)
 
     p_list = sub.add_parser("list", help="Show all registered users")
     p_list.set_defaults(func=commands.cmd_list)
 
-    p_find = sub.add_parser("find", help="Find users by name (partial match)")
-    p_find.add_argument("--name", required=True, help="Name to search for")
+    p_find = sub.add_parser(
+        "find", help="Find a user by exact UID (O(log n) lookup) or by name (partial match)")
+    p_find_group = p_find.add_mutually_exclusive_group(required=True)
+    p_find_group.add_argument("--uid", help="Exact UID to look up (O(log n) device-side lookup)")
+    p_find_group.add_argument("--name", help="Name to search for (partial match)")
     p_find.set_defaults(func=commands.cmd_find)
 
     p_add = sub.add_parser("add", help="Register a new user")
@@ -101,6 +65,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_remove.add_argument(
         "--force", action="store_true",
         help="Delete ALL users from the device. Use with care.",
+    )
+    p_remove.add_argument(
+        "--no-backup", action="store_true",
+        help=(
+            "Skip the automatic pre-wipe backup when used with --force. "
+            "Saves a full device list() round trip (~20s at 20000 users) "
+            "-- only use this if you don't need a recovery copy."
+        ),
     )
     p_remove.add_argument(
         "--except", dest="except_uids", metavar="UID[,UID,...]",
@@ -182,9 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_import = sub.add_parser(
         "import",
-        help="Import users from a JSON or CSV file (batch, single flash write)",
+        help="Import users from a JSON, CSV, or .bin file (batch, single flash write)",
     )
-    p_import.add_argument("file", help="Path to JSON or CSV file")
+    p_import.add_argument("file", help="Path to JSON, CSV, or .bin file")
     p_import.add_argument(
         "--dry-run", action="store_true",
         help="Parse and validate the CSV without writing to the device.",
@@ -193,6 +165,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--clear", action="store_true",
         help="Wipe all existing users before importing.",
     )
+    p_import.add_argument(
+        "--no-backup", action="store_true",
+        help=(
+            "Skip the automatic pre-wipe backup when used with --clear. "
+            "Skips the export_bin round trip and the json/bin prompt entirely "
+            "-- only use this if you don't need a recovery copy."
+        ),
+    )
+    p_import.add_argument(
+        "--json-transport", action="store_true",
+        help="Use the older per-batch JSON transport instead of the raw-binary "
+             "one (slower, more device-side CPU/SRAM -- fallback for older "
+             "firmware or if the binary path misbehaves on your hardware).",
+    )
     p_import.set_defaults(func=commands.cmd_import)
 
     p_export = sub.add_parser(
@@ -200,21 +186,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="Export all users from the device to a JSON file",
     )
     p_export.add_argument("file", help="Output file path (e.g. users_backup.json)")
+    p_export.add_argument(
+        "--json-transport", action="store_true",
+        help="Use the older per-user JSON 'list' transport instead of the "
+             "raw-binary one (fallback for older firmware or if the binary "
+             "path misbehaves on your hardware).",
+    )
     p_export.set_defaults(func=commands.cmd_export)
 
+    p_sync = sub.add_parser(
+        "sync",
+        help="Make the device DB exactly match a local JSON/CSV/.bin file "
+             "(merge-diff: only removes/adds/replaces what actually differs)",
+    )
+    p_sync.add_argument("file", help="Path to JSON, CSV, or .bin file")
+    p_sync.add_argument(
+        "--dry-run", action="store_true",
+        help="Compute and show the remove/add/replace diff without changing the device.",
+    )
+    p_sync.set_defaults(func=commands.cmd_sync)
+
     return parser
+
+
+# Subcommands that need an open device connection. Shared with repl.py so
+# the shell can show a friendly "not connected" message instead of letting
+# these hit SerialManager's own auto-detect when the user has explicitly
+# disconnected.
+DEVICE_COMMANDS = frozenset({
+    "list", "find", "add", "remove", "rename", "scan", "tag-renew",
+    "status", "netstatus", "ntp-time", "ntp-sync", "configure", "timezone", "import", "export", "sync",
+})
+
+
+def subcommand_names(parser: argparse.ArgumentParser) -> set:
+    """All subcommand names the parser accepts (e.g. 'list', 'import').
+
+    The shell uses this instead of hardcoding its own copy of the command
+    list, so build_parser() stays the single source of truth.
+    """
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return set(action.choices.keys())
+    return set()
+
+
+def command_help(parser: argparse.ArgumentParser) -> dict:
+    """{command_name: one-line help string}, read straight off the parser
+    (the same text --help shows) so the shell's help listing can't drift
+    out of sync with build_parser()."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return {a.dest: (a.help or "") for a in action._choices_actions}
+    return {}
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    commands_needing_port = {
-        "list", "find", "add", "remove", "rename", "scan", "tag-renew",
-        "status", "netstatus", "ntp-time", "ntp-sync", "configure", "timezone", "import", "export",
-    }
+    if args.command is None:
+        try:
+            from repl import run_repl
+        except ImportError:
+            utils.error(
+                "Interactive mode requires prompt_toolkit and rich. Install "
+                "them with: pip install prompt_toolkit rich"
+            )
+            sys.exit(1)
+        run_repl(parser, initial_port=args.port)
+        return
 
-    if args.command in commands_needing_port and args.port is None:
+    if args.command in DEVICE_COMMANDS and args.port is None:
         detected = find_esp32_port()
         if detected is None:
             utils.error(
