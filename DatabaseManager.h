@@ -1,34 +1,26 @@
 #pragma once
 /*
  * DatabaseManager.h
- * Owns users.json on LittleFS. Single responsibility: persistence + lookups.
- * Does NOT know about RFID or the LCD. The caller (SystemController) is
- * responsible for pausing RFID scanning around write operations.
+ * Owns users.bin on LittleFS. Persistence + lookups only (no RFID, no LCD).
  *
- * Schema (per user):
- *   { "uid": "A43FE5S4", "name": "Azrael",
- *     "registered": "2024-04-06", "valid_days": 30 }
- * 'registered' is an ISO-8601 date (YYYY-MM-DD) stamped by the Python CLI
- * at creation time -- the firmware never generates or edits it, it only
- * validates the format and stores it verbatim. 'valid_days' may be
- * fractional (e.g. 0.01) so short-lived badges can be tested quickly.
+ * Binary format (v1): header ("RUD1" + version + recordSize uint16 LE)
+ * + N fixed-width records. Record count derived from file size. Per-record
+ * CRC32 -- a corrupt record is skipped, not the whole database. Sorted by
+ * UID; add/remove use suffix rewrite.
  *
- * --- Admin badges ---
- * An "admin" NFC card has no expiration and no registration date -- it is
- * always granted regardless of NTP sync state. Admins are stored with the
- * sentinel values below (empty registered, valid_days = -1). Old user
- * databases (created before the admin feature) always have a real date and
- * a non-negative valid_days, so the admin detection is fully backward
- * compatible -- no migration step is needed.
+ * Legacy users.json is auto-converted on first boot and kept as .bak.
+ * Admin badges: empty registered + validDays -1.
  */
 
 #include <Arduino.h>
 #include <vector>
-#include <map>
+#include <set>
+#include <algorithm>
+#include <cstring>
 #include <esp_heap_caps.h>
+#include "Config.h"
 
-// PSRAM allocator for STL containers.  Routes malloc/free to the 8MB
-// external PSRAM so large containers don't overflow the ~300KB SRAM heap.
+// STL allocator backed by external PSRAM.
 template <typename T>
 struct PsramAllocator {
   using value_type = T;
@@ -46,65 +38,86 @@ struct PsramAllocator {
   bool operator!=(const PsramAllocator&) const { return false; }
 };
 
-// Sentinels used to mark an admin badge inside the JSON database.
-//   - ADMIN_REGISTERED is the empty string (the normal validator accepts
-//     it specifically as a sentinel; any non-empty value must still be
-//     a real YYYY-MM-DD date).
-//   - ADMIN_VALID_DAYS is -1.0 (the normal validator accepts it as a
-//     sentinel; any other value must be >= 0).
 #define ADMIN_REGISTERED       ""
 #define ADMIN_VALID_DAYS       (-1.0)
 
-struct UserRecord {
-  String uid;         // stored upper-case, no separators
-  String name;
-  String registered;  // ISO-8601 date "YYYY-MM-DD", or "" for admin badges
-  double validDays = 0.0;  // >= 0 for normal badges, -1 for admin badges
+static const char     DB_MAGIC[4]     = {'R', 'U', 'D', '1'};
+static const uint8_t  DB_VERSION      = 1;
+static const size_t   DB_HEADER_SIZE  = 4 /*magic*/ + 1 /*version*/ + 2 /*recordSize*/;
+static const size_t   DB_UID_BYTES    = MAX_UID_HEX_LEN / 2;  // 10
+static const size_t   DB_RECORD_SIZE  =
+    1                    /* uidLen     */ +
+    DB_UID_BYTES         /* uidBytes   */ +
+    1                    /* nameLen    */ +
+    MAX_NAME_LEN          /* nameBytes  */ +
+    2                    /* regDays    */ +
+    sizeof(double)       /* validDays  */ +
+    4                    /* crc32      */;
+static const uint16_t DB_ADMIN_DAYS_SENTINEL = 0xFFFF;
 
+// Fixed-capacity inline string; avoids String heap allocations.
+template <size_t N>
+struct FixedStr {
+  char buf[N + 1];
+  FixedStr() { buf[0] = '\0'; }
+  FixedStr(const String& s) { *this = s; }
+  FixedStr& operator=(const String& s) {
+    size_t len = s.length();
+    if (len > N) len = N;
+    memcpy(buf, s.c_str(), len);
+    buf[len] = '\0';
+    return *this;
+  }
+  operator String() const { return String(buf); }
+  const char* c_str() const { return buf; }
+  size_t length() const { return strlen(buf); }
+  bool operator<(const FixedStr& other) const { return strcmp(buf, other.buf) < 0; }
+  bool operator==(const FixedStr& other) const { return strcmp(buf, other.buf) == 0; }
+  bool operator==(const String& other) const { return other == buf; }
+};
+
+struct UserRecord {
+  FixedStr<MAX_UID_HEX_LEN> uid;     // upper-case, no separators
+  FixedStr<MAX_NAME_LEN> name;
+  FixedStr<10> registered;           // ISO-8601, or "" for admin badges
+  double validDays = 0.0;            // -1 for admin badges
+
+  // Checks both sentinels so a partially-corrupted record still resolves.
   bool isAdmin() const {
-    // Treat either sentinel as admin. Both are set together when an admin
-    // is created, but checking both makes load() resilient against a
-    // partially-corrupted record (e.g. if a future CLI writes only one).
     return registered.length() == 0 || validDays == ADMIN_VALID_DAYS;
   }
 };
 
 class DatabaseManager {
 public:
-  bool begin();                       // mounts LittleFS, loads DB (or recreates it)
-  bool load();                        // (re)loads users_ from USERS_DB_PATH
-  bool save();                        // atomically persists users_ to USERS_DB_PATH
+  bool begin();
+  bool load();
+  bool save();
 
   bool addUser(const String& uid, const String& name, const String& registered,
                double validDays, String& errorOut);
   bool removeUser(const String& uid, String& errorOut);
   bool renameUser(const String& uid, const String& newName, String& errorOut);
-  bool clearAll(String& errorOut);    // wipes every user, persists immediately
+  bool clearAll(String& errorOut);
 
-  // Deletes every user whose UID is NOT in keepUids, persists immediately.
-  // keepUids must be non-empty (use clearAll() to wipe everything) and every
-  // entry must be a well-formed UID -- a typo in the keep list must never
-  // silently turn into "delete everyone", so this fails closed instead of
-  // guessing. UIDs in keepUids that aren't actually in the database are
-  // simply ignored (not an error). On success, removedCountOut is set to
-  // the number of users deleted.
+  // Deletes every user NOT in keepUids. Fails closed if keepUids is empty.
   bool removeAllExcept(const std::vector<String>& keepUids, size_t& removedCountOut,
                         String& errorOut);
 
-  // Batch import mode: when active, addUser() skips the per-call save().
-  // Caller must call setImportMode(true) before the batch and
-  // setImportMode(false) + save() after the last addUserNoSave().
+  // While active, addUser() skips its per-call save(). Caller must pair
+  // setImportMode(true)/addUserNoSave() with setImportMode(false)+save().
   void setImportMode(bool on);
   bool isImportMode() const { return importMode_; }
 
-  // Inserts a user into RAM only (no persistence). Returns false on
-  // validation error -- the caller should stop the import and report it.
+  // Pre-allocates PSRAM to avoid the ~2x transient spike from repeated
+  // push_back() during import.
+  void reserveForImport(size_t additionalUsers);
+
   bool addUserNoSave(const String& uid, const String& name,
                      const String& registered, double validDays,
                      String& errorOut);
 
-  // Renews a user: sets registered = today, validDays = new value.
-  // Returns false if UID not found.
+  // Sets registered = today, validDays = new value.
   bool renewUser(const String& uid, const String& today, double validDays,
                  String& errorOut);
 
@@ -113,9 +126,57 @@ public:
   size_t userCount() const { return users_.size(); }
   const UserRecord& userAt(size_t i) const { return users_[i]; }
 
-  const char* dbPath() const;         // path of USERS_DB_PATH on LittleFS
-  size_t fsTotalBytes() const;        // total LittleFS partition size, in bytes
-  size_t fsUsedBytes() const;         // bytes currently used on LittleFS
+  uint32_t computeCrc32() const;
+  static size_t recordSize();
+  void encodeUserAt(size_t i, uint8_t* outRec) const;
+
+  // Same validation as addUserNoSave(). False on corrupt/duplicate/invalid.
+  bool addUserFromRawRecord(const uint8_t* rec, String& errorOut);
+
+  // ---- sync support ----
+  // Manifest entry = uidLen(1) + uidBytes(DB_UID_BYTES) + per-record CRC32(4).
+  // Reuses the same trailing CRC32 already stored in each record (see
+  // encodeRecord_) -- no separate "manifest checksum" needed.
+  static size_t manifestEntrySize();
+  void encodeManifestEntryAt(size_t i, uint8_t* outEntry) const;
+
+  // Wire size of a bare UID entry (uidLen + uidBytes, no name/dates) --
+  // the "remove" list's per-entry size in the sync protocol.
+  static size_t uidEntrySize();
+
+  // Sync mutators. No save() -- the "sync" command in SystemController
+  // persists once after all ops are applied.
+  //
+  // Batch remove: mark-then-compact instead of one erase() per call.
+  // erase() is an O(n) memmove, so N removes from an N-user db is
+  // O(n^2) -- slow enough on PSRAM to blow past the task watchdog on a
+  // large sync diff. beginRemoveBatch() snapshots the current size and
+  // clears the tombstone bitmap; removeUserRawNoSave() then just flips a
+  // bit (O(log n) lookup, O(1) mark) instead of shifting the array;
+  // endRemoveBatch() does a single O(n) compaction pass and returns the
+  // db to its normal (untombstoned) state. Caller must pair
+  // beginRemoveBatch() with exactly one endRemoveBatch() -- calling
+  // removeUserRawNoSave() outside an active batch falls back to the old
+  // immediate erase() so other callers keep working unchanged.
+  void beginRemoveBatch();
+  size_t endRemoveBatch();
+
+  // removeUserRawNoSave() keeps users_ sorted after every call (marks
+  // for removal inside a begin/endRemoveBatch() pair; immediate erase()
+  // otherwise). ADD no longer has its own mutator here: sync_apply's add
+  // phase reuses addUserFromRawRecord() + setImportMode() instead --
+  // append unsorted, single O(n log n) resort at the end -- the same
+  // strategy import_bin uses, rather than a second sorted-insert path.
+  bool removeUserRawNoSave(const uint8_t* uidEntry, String& errorOut);
+  // uid in `rec` must already exist; overwrites the whole record in place
+  // (position is unchanged since a replace never changes uid). Requires
+  // users_ to be sorted (binary search via indexOfUid_) -- callers must
+  // not be inside an unresolved setImportMode(true) window.
+  bool replaceUserFromRawRecord(const uint8_t* rec, String& errorOut);
+
+  const char* dbPath() const;
+  size_t fsTotalBytes() const;
+  size_t fsUsedBytes() const;
 
   static String normalizeUid(const String& rawUid);
   static bool isValidUidFormat(const String& uid);
@@ -123,28 +184,49 @@ public:
   static bool isValidRegisteredDate(const String& registered);
   static bool isValidValidDays(double validDays);
 
-  // Escapes a string for safe manual embedding inside a hand-built JSON
-  // string literal (used by save() and SerialProtocol::sendUserList(),
-  // which write "uid"/"name" directly to a stream instead of going
-  // through ArduinoJson). Without this, a name containing '"' or '\'
-  // corrupts users.json on the next save() -- which then fails to parse
-  // on the next boot and silently wipes the whole database via
-  // recreateEmpty_(). Handles '"', '\', control chars (\n, \r, \t, and
-  // anything < 0x20 via \u00XX).
+  // Escapes '"', '\', and control chars for hand-built JSON.
   static String jsonEscape(const String& in);
 
 private:
+  // Always sorted ascending by uid; enables binary search + suffix rewrite.
   std::vector<UserRecord, PsramAllocator<UserRecord>> users_;
-  // Maps normalized uid -> index into users_. Previously this was a
-  // std::set<String> used only to reject duplicates on insert, while every
-  // lookup (findUser/removeUser/renameUser/renewUser -- i.e. every single
-  // badge scan) fell back to a linear scan over users_ via indexOfUid_().
-  // At MAX_USERS that made every card tap an O(n) scan despite the index
-  // existing. Storing the index turns those into real O(log n) lookups.
-  std::map<String, size_t, std::less<String>,
-           PsramAllocator<std::pair<const String, size_t>>> uidIndex_;
+
+  using UidKey = FixedStr<MAX_UID_HEX_LEN>;
+
+  // Import: records appended unsorted, re-sorted once at import_end.
+  // Binary search only valid over [0, importBaselineCount_); duplicate
+  // checks against the batch itself use importSeen_.
+  std::set<UidKey, std::less<UidKey>, PsramAllocator<UidKey>> importSeen_;
+  size_t importBaselineCount_ = 0;
+  bool existsInBaseline_(const UidKey& norm) const;
+
   bool importMode_ = false;
   void recreateEmpty_();
-  void rebuildIndex_();         // rebuilds uidIndex_ from users_ (call after any index-shifting change)
+
+  // Remove-batch state (see beginRemoveBatch()/endRemoveBatch()). Sized
+  // to users_.size() at beginRemoveBatch() time; index i true means
+  // users_[i] is pending removal at endRemoveBatch().
+  std::vector<bool> removeTombstones_;
+  bool removeBatchActive_ = false;
+
   int indexOfUid_(const String& uid) const;
+  size_t lowerBound_(const String& normUid) const;
+
+  bool loadBinary_();
+  bool loadLegacyJsonAndMigrate_();
+
+  static void encodeRecord_(const UserRecord& u, uint8_t* outRec);
+  static bool decodeRecord_(const uint8_t* rec, UserRecord& out);
+
+  bool saveSingleRecord_(size_t idx);
+
+  // Add = suffix-only write. Remove falls back to full save() (no
+  // truncate() available on this LittleFS).
+  bool saveSuffixFrom_(size_t startIdx);
+
+  // Proleptic Gregorian day count (Hinnant's civil_from_days/days_from_civil).
+  static uint16_t dateToDays_(const char* registered);
+  static String   daysToDate_(uint16_t days);
+
+  static uint32_t crc32_(const uint8_t* data, size_t len, uint32_t crc = 0);
 };
