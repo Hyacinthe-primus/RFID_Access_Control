@@ -1,16 +1,22 @@
-/*
- * DatabaseManager.cpp
-*/
-
 #include "DatabaseManager.h"
 #include "Config.h"
+#include "ImportProfiler.h"
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
 bool DatabaseManager::begin() {
   // false = do not format on mount failure yet; we want to try recovery first.
   if (!LittleFS.begin(false)) {
-    if (!LittleFS.format()) {
+    // LittleFS.format() on a 12MB partition blocks long enough (only on
+    // the first boot after flash) to starve the IDLE task and trigger the
+    // Task Watchdog (5s by default) -> reset during format.
+    // Remove the task from TWDT supervision while the format runs.
+    esp_err_t wdtErr = esp_task_wdt_delete(NULL);
+    bool formatted = LittleFS.format();
+    if (wdtErr == ESP_OK) esp_task_wdt_add(NULL);
+
+    if (!formatted) {
       return false;
     }
     if (!LittleFS.begin(false)) {
@@ -27,15 +33,28 @@ bool DatabaseManager::begin() {
 
 void DatabaseManager::recreateEmpty_() {
   users_.clear();
-  uidIndex_.clear();
 }
 
-void DatabaseManager::rebuildIndex_() {
-  uidIndex_.clear();
-  for (size_t i = 0; i < users_.size(); i++) uidIndex_[users_[i].uid] = i;
+static inline bool uidLess_(const UserRecord& a, const UserRecord& b) {
+  return a.uid < b.uid;  // FixedStr::operator< is strcmp, same order
+                         // lowerBound_()/indexOfUid_() use for the file.
 }
 
 bool DatabaseManager::load() {
+  bool ok = loadBinary_();
+  if (!ok) ok = loadLegacyJsonAndMigrate_();
+  if (!ok) return false;
+
+  // Re-sort if file predates the "always sorted" invariant. persist
+  // so suffix-rewrite saves can trust index-derived offsets.
+  if (!std::is_sorted(users_.begin(), users_.end(), uidLess_)) {
+    std::sort(users_.begin(), users_.end(), uidLess_);
+    save();
+  }
+  return true;
+}
+
+bool DatabaseManager::loadBinary_() {
   if (!LittleFS.exists(USERS_DB_PATH)) {
     recreateEmpty_();
     return false;
@@ -47,26 +66,81 @@ bool DatabaseManager::load() {
     return false;
   }
 
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, f);
-  f.close();
-
-  if (err || !doc.is<JsonArray>()) {
+  uint8_t header[DB_HEADER_SIZE];
+  if (f.read(header, DB_HEADER_SIZE) != (int)DB_HEADER_SIZE ||
+      memcmp(header, DB_MAGIC, 4) != 0 ||
+      header[4] != DB_VERSION ||
+      (uint16_t)(header[5] | (header[6] << 8)) != (uint16_t)DB_RECORD_SIZE) {
+    // Bad header – fall through to legacy migration or recreateEmpty_.
+    f.close();
     recreateEmpty_();
     return false;
   }
 
+  size_t fileSize = f.size();
+  size_t payloadBytes = (fileSize > DB_HEADER_SIZE) ? (fileSize - DB_HEADER_SIZE) : 0;
+  size_t numRecords = payloadBytes / DB_RECORD_SIZE;  // floor division: a torn
+                                                        // trailing record (power
+                                                        // loss mid-write) is just
+                                                        // dropped, not "parsed".
+
   std::vector<UserRecord, PsramAllocator<UserRecord>> loaded;
-  for (JsonObject obj : doc.as<JsonArray>()) {
+  loaded.reserve(numRecords);
+  bool sawAnyContent = numRecords > 0;
+  bool sawParseError = false;
+
+  uint8_t rec[DB_RECORD_SIZE];
+  for (size_t i = 0; i < numRecords; i++) {
+    if (f.read(rec, DB_RECORD_SIZE) != (int)DB_RECORD_SIZE) { sawParseError = true; break; }
+
+    UserRecord u;
+    if (!decodeRecord_(rec, u)) { sawParseError = true; continue; }  // CRC/shape failure - skip this record only
+    if (!isValidUidFormat(u.uid) || !isValidName(u.name)) { sawParseError = true; continue; }
+    if (!isValidRegisteredDate(u.registered)) { sawParseError = true; continue; }
+    if (!isValidValidDays(u.validDays)) { sawParseError = true; continue; }
+    loaded.push_back(u);
+  }
+  f.close();
+
+  // Same "only fail if truly nothing usable" rule as the old NDJSON loader.
+  if (sawAnyContent && loaded.empty() && sawParseError) {
+    return false;
+  }
+
+  users_ = loaded;
+  return true;
+}
+
+bool DatabaseManager::loadLegacyJsonAndMigrate_() {
+  if (!LittleFS.exists(USERS_DB_LEGACY_JSON_PATH)) return false;
+
+  File f = LittleFS.open(USERS_DB_LEGACY_JSON_PATH, "r");
+  if (!f) return false;
+
+  // Same NDJSON-line parser the firmware used before the binary format
+  // kept verbatim (minus the now-stale "old code built a DOM" framing)
+  // purely as a one-time migration path, not the steady-state loader.
+  std::vector<UserRecord, PsramAllocator<UserRecord>> loaded;
+  bool sawAnyContent = false;
+  bool sawParseError = false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    sawAnyContent = true;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, line);
+    if (err || !doc.is<JsonObject>()) {
+      sawParseError = true;
+      continue;
+    }
+    JsonObject obj = doc.as<JsonObject>();
     if (!obj.containsKey("uid") || !obj.containsKey("name")) continue;
+
     UserRecord u;
     u.uid = normalizeUid(String((const char*)obj["uid"]));
     u.name = String((const char*)obj["name"]);
-    // registered/valid_days are new fields -- default gracefully if an old
-    // (pre-expiration) users.json is ever loaded, rather than dropping the user.
-    // For admin badges the JSON will contain "" and -1 respectively (see
-    // DatabaseManager.h's ADMIN_* sentinels); both are accepted by the
-    // validators below as admin sentinels.
     u.registered = obj.containsKey("registered") ? String((const char*)obj["registered"]) : String("1970-01-01");
     u.validDays = obj.containsKey("valid_days") ? obj["valid_days"].as<double>() : 0.0;
     if (!isValidUidFormat(u.uid) || !isValidName(u.name)) continue;
@@ -74,47 +148,440 @@ bool DatabaseManager::load() {
     if (!isValidValidDays(u.validDays)) continue;
     loaded.push_back(u);
   }
+  f.close();
+
+  if (sawAnyContent && loaded.empty() && sawParseError) {
+    return false;  // legacy file itself was unreadable, caller wipes clean
+  }
 
   users_ = loaded;
-  rebuildIndex_();
+
+  // Persist immediately in the new binary format, then retire the JSON
+  // file so this migration doesn't run again on the next boot. Keep the
+  // original as a .bak rather than deleting it - migration bugs are
+  // exactly the kind of thing you want a recovery path for.
+  if (!save()) return false;
+  LittleFS.remove(USERS_DB_LEGACY_JSON_PATH ".bak");  // in case of a retry after a previous partial migration
+  LittleFS.rename(USERS_DB_LEGACY_JSON_PATH, USERS_DB_LEGACY_JSON_PATH ".bak");
+  return true;
+}
+
+void DatabaseManager::encodeRecord_(const UserRecord& u, uint8_t* rec) {
+  size_t off = 0;
+
+  // uid: hex -> raw bytes. Read off FixedStr's inline buffer directly --
+  // do NOT assign to String (heap-allocates on SRAM per call).
+  const char* uidC = u.uid.c_str();
+  uint8_t uidLen = (uint8_t)(u.uid.length() / 2);
+  rec[off++] = uidLen;
+  uint8_t* uidBytes = &rec[off];
+  memset(uidBytes, 0, DB_UID_BYTES);
+  for (uint8_t b = 0; b < uidLen; b++) {
+    char hi = uidC[b * 2], lo = uidC[b * 2 + 1];
+    auto nib = [](char c) -> uint8_t { return (c <= '9') ? (c - '0') : (toupper(c) - 'A' + 10); };
+    uidBytes[b] = (uint8_t)((nib(hi) << 4) | nib(lo));
+  }
+  off += DB_UID_BYTES;
+
+  uint8_t nameLen = (uint8_t)u.name.length();  // isValidName() caps this at MAX_NAME_LEN
+  rec[off++] = nameLen;
+  uint8_t* nameBytes = &rec[off];
+  memset(nameBytes, 0, MAX_NAME_LEN);
+  memcpy(nameBytes, u.name.c_str(), nameLen);
+  off += MAX_NAME_LEN;
+
+  uint16_t regDays = dateToDays_(u.registered.c_str());
+  rec[off++] = (uint8_t)(regDays & 0xFF);
+  rec[off++] = (uint8_t)((regDays >> 8) & 0xFF);
+
+  memcpy(&rec[off], &u.validDays, sizeof(double));
+  off += sizeof(double);
+
+  uint32_t crc = crc32_(rec, off);
+  rec[off++] = (uint8_t)(crc & 0xFF);
+  rec[off++] = (uint8_t)((crc >> 8) & 0xFF);
+  rec[off++] = (uint8_t)((crc >> 16) & 0xFF);
+  rec[off++] = (uint8_t)((crc >> 24) & 0xFF);
+}
+
+// Inverse of encodeRecord_(). Returns false on CRC mismatch or bad
+// uidLen/nameLen -- caller skips this record. Content validation
+// (uid/name/date format) is still the caller's job.
+bool DatabaseManager::decodeRecord_(const uint8_t* rec, UserRecord& out) {
+  uint32_t storedCrc = (uint32_t)rec[DB_RECORD_SIZE - 4] |
+                        ((uint32_t)rec[DB_RECORD_SIZE - 3] << 8) |
+                        ((uint32_t)rec[DB_RECORD_SIZE - 2] << 16) |
+                        ((uint32_t)rec[DB_RECORD_SIZE - 1] << 24);
+  uint32_t actualCrc = crc32_(rec, DB_RECORD_SIZE - 4);
+  if (storedCrc != actualCrc) return false;
+
+  size_t off = 0;
+  uint8_t uidLen = rec[off++];
+  const uint8_t* uidBytes = &rec[off]; off += DB_UID_BYTES;
+  uint8_t nameLen = rec[off++];
+  const uint8_t* nameBytes = &rec[off]; off += MAX_NAME_LEN;
+  uint16_t regDays = (uint16_t)rec[off] | ((uint16_t)rec[off + 1] << 8); off += 2;
+  double validDays; memcpy(&validDays, &rec[off], sizeof(double));
+
+  if (uidLen > DB_UID_BYTES || nameLen > MAX_NAME_LEN) return false;
+
+  static const char kHex[] = "0123456789ABCDEF";
+  char uidHex[MAX_UID_HEX_LEN + 1];
+  for (size_t b = 0; b < uidLen; b++) {
+    uidHex[b * 2]     = kHex[(uidBytes[b] >> 4) & 0xF];
+    uidHex[b * 2 + 1] = kHex[uidBytes[b] & 0xF];
+  }
+  uidHex[uidLen * 2] = '\0';
+
+  out.uid = String(uidHex);
+  char nameBuf[MAX_NAME_LEN + 1];
+  memcpy(nameBuf, nameBytes, nameLen);
+  nameBuf[nameLen] = '\0';
+  out.name = String(nameBuf);
+  out.registered = daysToDate_(regDays);
+  out.validDays = validDays;
+  return true;
+}
+
+size_t DatabaseManager::recordSize() {
+  return DB_RECORD_SIZE;
+}
+
+void DatabaseManager::encodeUserAt(size_t i, uint8_t* outRec) const {
+  encodeRecord_(users_[i], outRec);
+}
+
+bool DatabaseManager::addUserFromRawRecord(const uint8_t* rec, String& errorOut) {
+  UserRecord u;
+  if (!decodeRecord_(rec, u)) {
+    errorOut = "Corrupt record (CRC32 mismatch or invalid length)";
+    return false;
+  }
+  // Reuse addUserNoSave() for validation/dedup (shared with batch_add).
+  return addUserNoSave(u.uid, u.name, u.registered, u.validDays, errorOut);
+}
+
+size_t DatabaseManager::manifestEntrySize() {
+  return 1 + DB_UID_BYTES + 4;
+}
+
+size_t DatabaseManager::uidEntrySize() {
+  return 1 + DB_UID_BYTES;
+}
+
+void DatabaseManager::encodeManifestEntryAt(size_t i, uint8_t* outEntry) const {
+  // Reuse encodeRecord_ rather than re-deriving uid bytes/CRC placement --
+  // one encode path to trust. Layout: [0]=uidLen [1..DB_UID_BYTES]=uidBytes
+  // ... [-4:]=per-record CRC32 (see encodeRecord_'s comment on that CRC).
+  uint8_t rec[DB_RECORD_SIZE];
+  encodeRecord_(users_[i], rec);
+  memcpy(outEntry, rec, 1 + DB_UID_BYTES);
+  memcpy(outEntry + 1 + DB_UID_BYTES, rec + DB_RECORD_SIZE - 4, 4);
+}
+
+void DatabaseManager::beginRemoveBatch() {
+  removeTombstones_.assign(users_.size(), false);
+  removeBatchActive_ = true;
+}
+
+size_t DatabaseManager::endRemoveBatch() {
+  if (!removeBatchActive_) return 0;
+  size_t writeIdx = 0;
+  size_t removedCount = 0;
+  for (size_t readIdx = 0; readIdx < users_.size(); readIdx++) {
+    bool tomb = readIdx < removeTombstones_.size() && removeTombstones_[readIdx];
+    if (tomb) {
+      removedCount++;
+    } else {
+      if (writeIdx != readIdx) users_[writeIdx] = users_[readIdx];
+      writeIdx++;
+    }
+    if ((readIdx & 0xFF) == 0xFF) esp_task_wdt_reset();
+  }
+  users_.resize(writeIdx);
+  removeTombstones_.clear();
+  removeTombstones_.shrink_to_fit();
+  removeBatchActive_ = false;
+  return removedCount;
+}
+
+bool DatabaseManager::removeUserRawNoSave(const uint8_t* uidEntry, String& errorOut) {
+  uint8_t uidLen = uidEntry[0];
+  if (uidLen == 0 || uidLen > DB_UID_BYTES) {
+    errorOut = "Corrupt remove entry (bad uidLen)";
+    return false;
+  }
+  static const char kHex[] = "0123456789ABCDEF";
+  char uidHex[MAX_UID_HEX_LEN + 1];
+  for (uint8_t b = 0; b < uidLen; b++) {
+    uint8_t byte = uidEntry[1 + b];
+    uidHex[b * 2]     = kHex[(byte >> 4) & 0xF];
+    uidHex[b * 2 + 1] = kHex[byte & 0xF];
+  }
+  uidHex[uidLen * 2] = '\0';
+  String uid(uidHex);
+
+  int idx = indexOfUid_(uid);
+  if (idx < 0) { errorOut = "UID not found: " + uid; return false; }
+
+  if (removeBatchActive_) {
+    // Marking (not erasing) keeps users_ -- and therefore every other
+    // index found via indexOfUid_() during this same batch -- stable
+    // until endRemoveBatch() compacts once at the end. A uid marked
+    // twice (shouldn't happen; the host dedupes the diff) just re-marks
+    // the same already-true bit, which is harmless.
+    if ((size_t)idx < removeTombstones_.size()) removeTombstones_[idx] = true;
+    return true;
+  }
+  users_.erase(users_.begin() + idx);
+  return true;
+}
+
+bool DatabaseManager::replaceUserFromRawRecord(const uint8_t* rec, String& errorOut) {
+  UserRecord u;
+  if (!decodeRecord_(rec, u)) {
+    errorOut = "Corrupt record (CRC32 mismatch or invalid length)";
+    return false;
+  }
+  if (!isValidUidFormat(u.uid) || !isValidName(u.name) ||
+      !isValidRegisteredDate(u.registered) || !isValidValidDays(u.validDays)) {
+    errorOut = "Invalid decoded record contents";
+    return false;
+  }
+
+  String uid = u.uid;
+  int idx = indexOfUid_(uid);
+  if (idx < 0) { errorOut = "Replace target not found: " + uid; return false; }
+  users_[idx] = u;  // uid unchanged -- sort position/index unaffected
   return true;
 }
 
 bool DatabaseManager::save() {
-  // Stream the JSON directly to a temp file, one user at a time.
-  // This avoids allocating a single huge DynamicJsonDocument (~500KB for
-  // 4500 users) which would overflow the ESP32's SRAM heap.
+  // Remove from TWDT during save() -- a single LittleFS.open()/write()
+  // can block past the 5s WDT timeout (same issue as begin() + format).
+  esp_err_t wdtErr = esp_task_wdt_delete(NULL);
+  struct WdtGuard {
+    bool reAdd;
+    ~WdtGuard() { if (reAdd) esp_task_wdt_add(NULL); }
+  } wdtGuard{wdtErr == ESP_OK};
+
+  // Defensive: re-sort if import mode left users_ unsorted. O(n) in the
+  // already-sorted common case.
+  if (!std::is_sorted(users_.begin(), users_.end(), uidLess_)) {
+    std::sort(users_.begin(), users_.end(), uidLess_);
+  }
+
+  // Full rewrite. Used for bulk ops; single-record ops use
+  // saveSingleRecord_() / saveSuffixFrom_() instead.
   File f = LittleFS.open(USERS_DB_TMP_PATH, "w");
   if (!f) return false;
 
-  f.print('[');
+  uint8_t header[DB_HEADER_SIZE];
+  memcpy(header, DB_MAGIC, 4);
+  header[4] = DB_VERSION;
+  header[5] = (uint8_t)(DB_RECORD_SIZE & 0xFF);
+  header[6] = (uint8_t)((DB_RECORD_SIZE >> 8) & 0xFF);
+  if (f.write(header, DB_HEADER_SIZE) != DB_HEADER_SIZE) { f.close(); return false; }
+
+  // Chunked flush: ~110 records fit in 8KB. PSRAM-allocated (must not be
+  // on stack -- overflows the 8KB Arduino loop task).
+  static const size_t kRecordsPerFlush = 8192 / DB_RECORD_SIZE;
+  static const size_t kFlushBytes = kRecordsPerFlush * DB_RECORD_SIZE;
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(kFlushBytes, MALLOC_CAP_SPIRAM);
+  if (!buf) { f.close(); return false; }
+  size_t bufLen = 0;
+
+  // Local RAII-ish guard so every return path below still frees buf --
+  // there are several early returns on write failure and it's easy to
+  // miss one if freeing is done by hand at each site.
+  struct BufGuard {
+    uint8_t* p;
+    ~BufGuard() { if (p) heap_caps_free(p); }
+  } bufGuard{buf};
+
   for (size_t i = 0; i < users_.size(); i++) {
-    if (i > 0) f.print(',');
-    const auto& u = users_[i];
-    // Manual JSON encoding per object -- avoids ArduinoJson entirely.
-    f.print("{\"uid\":\"");
-    f.print(u.uid); // uid is normalizeUid()'d to [0-9A-F] only -- never needs escaping
-    f.print("\",\"name\":\"");
-    f.print(jsonEscape(u.name));
-    f.print("\",\"registered\":\"");
-    f.print(u.registered);
-    f.print("\",\"valid_days\":");
-    f.print(u.validDays);
-    f.print('}');
+    unsigned long encodeStart = micros();
+    encodeRecord_(users_[i], &buf[bufLen]);
+    g_importProfile.saveEncodeUs += micros() - encodeStart;
+
+    bufLen += DB_RECORD_SIZE;
+    if (bufLen >= kFlushBytes) {
+      unsigned long writeStart = micros();
+      bool wok = (f.write(buf, bufLen) == bufLen);
+      g_importProfile.saveWriteUs += micros() - writeStart;
+      if (!wok) { f.close(); return false; }
+      bufLen = 0;
+    }
   }
-  f.print(']');
+  if (bufLen > 0) {
+    unsigned long writeStart = micros();
+    bool wok = (f.write(buf, bufLen) == bufLen);
+    g_importProfile.saveWriteUs += micros() - writeStart;
+    if (!wok) { f.close(); return false; }
+  }
   f.close();
 
-  LittleFS.remove(USERS_DB_PATH);
+  // Verify by re-reading before touching the canonical file. Catches a
+  // silently short/garbled write (buffer bug, flash wear-out, etc.)
+  // *before* we commit to it -- otherwise a bad tmp file would still pass
+  // the rename below and become the new users.bin.
+  {
+    File vf = LittleFS.open(USERS_DB_TMP_PATH, "r");
+    if (!vf) return false;
+    uint8_t vHeader[DB_HEADER_SIZE];
+    if (vf.read(vHeader, DB_HEADER_SIZE) != (int)DB_HEADER_SIZE ||
+        memcmp(vHeader, header, DB_HEADER_SIZE) != 0) {
+      vf.close();
+      return false;
+    }
+    uint32_t actualCrc = 0;
+    uint8_t rec[DB_RECORD_SIZE];
+    bool readOk = true;
+    for (size_t i = 0; i < users_.size(); i++) {
+      if (vf.read(rec, DB_RECORD_SIZE) != (int)DB_RECORD_SIZE) { readOk = false; break; }
+      actualCrc = crc32_(rec, DB_RECORD_SIZE - 4, actualCrc);
+      // No esp_task_wdt_reset() here: this whole function runs with the
+      // task deliberately removed from the TWDT (see WdtGuard above), so
+      // there's no subscription left to reset -- that's what produced
+      // "esp_task_wdt_reset(): task not found" on real hardware.
+    }
+    vf.close();
+    if (!readOk || actualCrc != computeCrc32()) return false;
+  }
+
+  unsigned long finalizeStart = micros();
+  // LittleFS.rename() replaces an existing destination file in one call on
+  // this port (lfs_rename() is itself a single atomic commit), so the
+  // common case never has a window with no valid users.bin on flash --
+  // unlike the previous remove-then-rename, where a power loss between the
+  // two calls left no file at all and recreateEmpty_() silently started
+  // the device from zero on next boot. Fall back to the old two-step
+  // sequence only if the direct rename is ever rejected outright; that
+  // fallback is strictly worse but no worse than before this fix.
   bool ok = LittleFS.rename(USERS_DB_TMP_PATH, USERS_DB_PATH);
+  if (!ok) {
+    LittleFS.remove(USERS_DB_PATH);
+    ok = LittleFS.rename(USERS_DB_TMP_PATH, USERS_DB_PATH);
+  }
+  g_importProfile.saveFinalizeUs += micros() - finalizeStart;
   return ok;
+}
+
+bool DatabaseManager::saveSingleRecord_(size_t idx) {
+  // Single seek+write for rename/renew (same uid, same position).
+  if (!LittleFS.exists(USERS_DB_PATH)) return save();
+
+  // "r+": read/write without truncating. Falls back to full save() if
+  // this open mode isn't supported by the target core version.
+  File f = LittleFS.open(USERS_DB_PATH, "r+");
+  if (!f) return save();
+
+  size_t offset = DB_HEADER_SIZE + idx * DB_RECORD_SIZE;
+  if (!f.seek(offset)) { f.close(); return save(); }
+
+  uint8_t rec[DB_RECORD_SIZE];
+  encodeRecord_(users_[idx], rec);
+  bool ok = (f.write(rec, DB_RECORD_SIZE) == DB_RECORD_SIZE);
+  f.close();
+  return ok ? true : save();
+}
+
+bool DatabaseManager::saveSuffixFrom_(size_t startIdx) {
+  if (!LittleFS.exists(USERS_DB_PATH)) return save();
+
+  File f = LittleFS.open(USERS_DB_PATH, "r+");  // see saveSingleRecord_'s
+                                                 // comment on "r+" above.
+  if (!f) return save();
+
+  // If users_ shrunk (removeUser), we can't truncate in place -- LittleFS
+  // fs::File has no truncate(). Fall back to full save() for removals.
+  // Additions (growth) still get the suffix-only rewrite.
+  size_t curSize = f.size();
+  size_t newFileSize = DB_HEADER_SIZE + users_.size() * DB_RECORD_SIZE;
+  if (newFileSize < curSize) {
+    f.close();
+    return save();
+  }
+
+  size_t offset = DB_HEADER_SIZE + startIdx * DB_RECORD_SIZE;
+  if (!f.seek(offset)) { f.close(); return save(); }
+
+  // Only unregister from the TWDT once we enter the write loop.
+  // Earlier paths defer to save(), which manages the TWDT itself.
+  // Unregistering twice logs a "task not found" error, which can
+  // corrupt the JSON protocol on the shared UART.
+  esp_err_t wdtErr = esp_task_wdt_delete(NULL);
+  struct WdtGuard {
+    bool reAdd;
+    ~WdtGuard() { if (reAdd) esp_task_wdt_add(NULL); }
+  } wdtGuard{wdtErr == ESP_OK};
+
+  static const size_t kRecordsPerFlush = 8192 / DB_RECORD_SIZE;
+  static const size_t kFlushBytes = kRecordsPerFlush * DB_RECORD_SIZE;
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(kFlushBytes, MALLOC_CAP_SPIRAM);
+  if (!buf) {
+    f.close();
+    if (wdtGuard.reAdd) { esp_task_wdt_add(NULL); wdtGuard.reAdd = false; }
+    return save();
+  }
+  struct BufGuard {
+    uint8_t* p;
+    ~BufGuard() { if (p) heap_caps_free(p); }
+  } bufGuard{buf};
+
+  size_t bufLen = 0;
+  bool writeFailed = false;
+  for (size_t i = startIdx; i < users_.size(); i++) {
+    encodeRecord_(users_[i], &buf[bufLen]);
+    bufLen += DB_RECORD_SIZE;
+    if (bufLen >= kFlushBytes) {
+      if (f.write(buf, bufLen) != bufLen) { writeFailed = true; break; }
+      bufLen = 0;
+    }
+  }
+  if (!writeFailed && bufLen > 0) {
+    if (f.write(buf, bufLen) != bufLen) writeFailed = true;
+  }
+  f.close();
+  if (writeFailed) {
+    if (wdtGuard.reAdd) { esp_task_wdt_add(NULL); wdtGuard.reAdd = false; }
+    return save();
+  }
+  return true;
+}
+
+bool DatabaseManager::existsInBaseline_(const UidKey& norm) const {
+  // Binary search restricted to [0, importBaselineCount_) -- see the
+  // member comment on importBaselineCount_ in the header for why the
+  // search can't safely cover the whole array during an import.
+  size_t lo = 0, hi = importBaselineCount_;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int c = strcmp(users_[mid].uid.c_str(), norm.c_str());
+    if (c < 0) lo = mid + 1; else hi = mid;
+  }
+  return lo < importBaselineCount_ && users_[lo].uid == norm;
 }
 
 int DatabaseManager::indexOfUid_(const String& uid) const {
   String norm = normalizeUid(uid);
-  auto it = uidIndex_.find(norm);
-  if (it == uidIndex_.end()) return -1;
-  return (int)it->second;
+  size_t lo = 0, hi = users_.size();
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    int c = strcmp(users_[mid].uid.c_str(), norm.c_str());
+    if (c == 0) return (int)mid;
+    if (c < 0) lo = mid + 1; else hi = mid;
+  }
+  return -1;
+}
+
+size_t DatabaseManager::lowerBound_(const String& normUid) const {
+  size_t lo = 0, hi = users_.size();
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (strcmp(users_[mid].uid.c_str(), normUid.c_str()) < 0) lo = mid + 1; else hi = mid;
+  }
+  return lo;
 }
 
 bool DatabaseManager::addUser(const String& uid, const String& name, const String& registered,
@@ -124,19 +591,27 @@ bool DatabaseManager::addUser(const String& uid, const String& name, const Strin
   if (!isValidName(name)) { errorOut = "Invalid or empty name"; return false; }
   if (!isValidRegisteredDate(registered)) { errorOut = "Invalid 'registered' date (expected YYYY-MM-DD)"; return false; }
   if (!isValidValidDays(validDays)) { errorOut = "Invalid 'valid_days' (must be a non-negative number)"; return false; }
-  if (users_.size() >= MAX_USERS) { errorOut = "Database full (max 10000 users)"; return false; }
-  if (uidIndex_.count(norm)) { errorOut = "Duplicate UID"; return false; }
+  if (users_.size() >= MAX_USERS) { errorOut = "Database full (max " + String(MAX_USERS) + " users)"; return false; }
+
+  size_t pos = lowerBound_(norm);
+  if (pos < users_.size() && users_[pos].uid == norm) { errorOut = "Duplicate UID"; return false; }
 
   UserRecord u;
   u.uid = norm;
   u.name = name;
   u.registered = registered;
   u.validDays = validDays;
-  users_.push_back(u);
-  uidIndex_[norm] = users_.size() - 1;
+  users_.insert(users_.begin() + pos, u);
 
   if (!importMode_) {
-    if (!save()) { errorOut = "Failed to persist database"; users_.pop_back(); uidIndex_.erase(norm); return false; }
+    // Everything from pos onward just moved to a new offset (the new
+    // record took pos's old slot); saveSuffixFrom_ rewrites exactly that
+    // range instead of the whole file.
+    if (!saveSuffixFrom_(pos)) {
+      errorOut = "Failed to persist database";
+      users_.erase(users_.begin() + pos);
+      return false;
+    }
   }
   return true;
 }
@@ -147,15 +622,13 @@ bool DatabaseManager::removeUser(const String& uid, String& errorOut) {
 
   UserRecord backup = users_[idx];
   users_.erase(users_.begin() + idx);
-  // Every user after idx just shifted down by one position -- a plain
-  // uidIndex_.erase(backup.uid) would leave all of their stored indices
-  // stale (off by one), silently breaking future lookups for them.
-  rebuildIndex_();
 
-  if (!save()) {
+  // Everyone after idx shifted up by one slot, and the file is now one
+  // record shorter -- saveSuffixFrom_ rewrites idx..end at their new
+  // offsets and truncates off the now-stale trailing record.
+  if (!saveSuffixFrom_((size_t)idx)) {
     errorOut = "Failed to persist database";
     users_.insert(users_.begin() + idx, backup);
-    rebuildIndex_();
     return false;
   }
   return true;
@@ -170,10 +643,8 @@ bool DatabaseManager::removeAllExcept(const std::vector<String>& keepUids, size_
     return false;
   }
 
-  // Normalize + validate every keep UID up front. Fail closed on the first
-  // bad entry: a malformed UID here is almost certainly a typo, and
-  // silently dropping it would mean the caller keeps fewer users than they
-  // asked for (i.e. we'd delete someone they meant to protect).
+  // Validate keep UIDs up front. Fail closed on bad format (typo = silent
+  // user deletion otherwise).
   std::vector<String> keepNorm;
   keepNorm.reserve(keepUids.size());
   for (const auto& raw : keepUids) {
@@ -194,17 +665,18 @@ bool DatabaseManager::removeAllExcept(const std::vector<String>& keepUids, size_
     for (const auto& k : keepNorm) {
       if (u.uid == k) { keep = true; break; }
     }
-    if (keep) kept.push_back(u);
+    if (keep) kept.push_back(u);  // preserves users_'s existing sorted
+                                   // order, so kept stays sorted too.
   }
 
   removedCountOut = users_.size() - kept.size();
   users_ = kept;
-  rebuildIndex_();
 
+  // Bulk op -- most/all records typically move, so a full rewrite (via
+  // save()) is the right tool here, same as clearAll().
   if (!save()) {
     errorOut = "Failed to persist database";
     users_ = backup;
-    rebuildIndex_();
     removedCountOut = 0;
     return false;
   }
@@ -216,14 +688,10 @@ bool DatabaseManager::clearAll(String& errorOut) {
   // same shape as removeUser/renameUser, just at the whole-database scale.
   std::vector<UserRecord, PsramAllocator<UserRecord>> backup;
   backup.swap(users_);
-  std::map<String, size_t, std::less<String>,
-           PsramAllocator<std::pair<const String, size_t>>> backupIndex;
-  backupIndex.swap(uidIndex_);
 
   if (!save()) {
     errorOut = "Failed to persist database";
     backup.swap(users_);  // restore
-    backupIndex.swap(uidIndex_);
     return false;
   }
   return true;
@@ -237,7 +705,9 @@ bool DatabaseManager::renameUser(const String& uid, const String& newName, Strin
   String oldName = users_[idx].name;
   users_[idx].name = newName;
 
-  if (!save()) {
+  // Renaming never changes uid, so idx's sort position and file offset
+  // are unchanged -- this is the true single seek+write case.
+  if (!saveSingleRecord_((size_t)idx)) {
     errorOut = "Failed to persist database";
     users_[idx].name = oldName;
     return false;
@@ -263,13 +733,106 @@ bool DatabaseManager::renewUser(const String& uid, const String& today,
   users_[idx].registered = today;
   users_[idx].validDays = validDays;
 
-  if (!save()) {
+  // Renewal changes registered/validDays only, never uid -- same
+  // single-seek+write case as renameUser().
+  if (!saveSingleRecord_((size_t)idx)) {
     errorOut = "Failed to persist database";
     users_[idx].registered = oldRegistered;
     users_[idx].validDays = oldValidDays;
     return false;
   }
   return true;
+}
+
+uint32_t DatabaseManager::crc32_(const uint8_t* data, size_t len, uint32_t crc) {
+  static uint32_t table[256];
+  static bool tableReady = false;
+  if (!tableReady) {
+    for (uint32_t i = 0; i < 256; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      table[i] = c;
+    }
+    tableReady = true;
+  }
+  // crc=0 gives one-shot behavior. Passing a previous return continues
+  // the CRC (same convention as Python's zlib.crc32).
+  crc = crc ^ 0xFFFFFFFFu;
+  for (size_t i = 0; i < len; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+  return crc ^ 0xFFFFFFFFu;
+}
+
+uint32_t DatabaseManager::computeCrc32() const {
+  // CRC32 over every encoded record's payload, in sorted order. users_ is
+  // assumed sorted (load/save/import maintain this; save() re-checks
+  // defensively).
+  //
+  // IMPORTANT: encodeRecord_() appends a 4-byte per-record CRC32 to each
+  // record for single-record corruption detection. That trailing CRC
+  // MUST be excluded here (hash only the first DB_RECORD_SIZE - 4
+  // bytes). Including it makes each record a CRC32 "codeword" (data
+  // followed by its own CRC), and chaining CRC32 across codewords
+  // collapses to a value that depends only on the number of records,
+  // not their content -- silently defeating this exact check. Must
+  // stay identical to convert.py::compute_canonical_crc32() on the host.
+  uint8_t rec[DB_RECORD_SIZE];
+  uint32_t crc = 0;
+  for (size_t i = 0; i < users_.size(); i++) {
+    encodeRecord_(users_[i], rec);
+    crc = crc32_(rec, DB_RECORD_SIZE - 4, crc);
+  }
+  return crc;
+}
+
+// Howard Hinnant's days_from_civil, adapted from
+// https://howardhinnant.github.io/date_algorithms.html -- proleptic
+// Gregorian, days since 1970-01-01. Valid for any y/m/d whether or not
+// the date is a "real" one (e.g. 2024-02-30 computes *something*
+// consistent, it just won't round-trip back to the same string -- see
+// the caveat in DatabaseManager.h's file header comment).
+static int32_t daysFromCivil_(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const int32_t era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);                 // [0, 399]
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;  // [0, 365]
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;      // [0, 146096]
+  return era * 146097 + (int32_t)doe - 719468;
+}
+
+static void civilFromDays_(int32_t z, int& y, unsigned& m, unsigned& d) {
+  z += 719468;
+  const int32_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const unsigned doe = (unsigned)(z - era * 146097);                        // [0, 146096]
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+  const int32_t yy = (int32_t)yoe + era * 400;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);   // [0, 365]
+  const unsigned mp = (5 * doy + 2) / 153;                        // [0, 11]
+  d = doy - (153 * mp + 2) / 5 + 1;                                // [1, 31]
+  m = mp + (mp < 10 ? 3 : -9);                                     // [1, 12]
+  y = yy + (m <= 2);
+}
+
+uint16_t DatabaseManager::dateToDays_(const char* registered) {
+  if (registered[0] == '\0') return DB_ADMIN_DAYS_SENTINEL;  // ADMIN_REGISTERED
+  // Manual digit parsing -- avoids String alloc per call. Shape already
+  // validated by isValidRegisteredDate().
+  int y = (registered[0]-'0')*1000 + (registered[1]-'0')*100 + (registered[2]-'0')*10 + (registered[3]-'0');
+  unsigned mo = (unsigned)((registered[5]-'0')*10 + (registered[6]-'0'));
+  unsigned d  = (unsigned)((registered[8]-'0')*10 + (registered[9]-'0'));
+  int32_t days = daysFromCivil_(y, mo, d);
+  // Clamp to uint16 range (65535 = admin sentinel). Fails safe.
+  if (days < 0) days = 0;
+  if (days > 65534) days = 65534;
+  return (uint16_t)days;
+}
+
+String DatabaseManager::daysToDate_(uint16_t days) {
+  if (days == DB_ADMIN_DAYS_SENTINEL) return String("");
+  int y; unsigned mo, d;
+  civilFromDays_((int32_t)days, y, mo, d);
+  char buf[11];
+  snprintf(buf, sizeof(buf), "%04d-%02u-%02u", y, mo, d);
+  return String(buf);
 }
 
 String DatabaseManager::normalizeUid(const String& rawUid) {
@@ -308,15 +871,11 @@ bool DatabaseManager::isValidName(const String& name) {
   bool sawNonSpace = false;
   for (size_t i = 0; i < name.length(); i++) {
     unsigned char c = (unsigned char)name[i];
-    // Control characters (incl. \n, \r, \t) are rejected outright: even
-    // though jsonEscape() would now encode them safely, they'd still
-    // garble the 16x2 LCD line. '"' and '\' ARE allowed here -- they're
-    // valid in a display name and are made safe by jsonEscape() at every
-    // write site (save() and sendUserList()).
+    // Reject control chars (garble LCD). '"' and '\' are allowed,
+    // escaped by jsonEscape() at write sites.
     if (c < 0x20) return false;
     if (!isspace(c)) sawNonSpace = true;
   }
-  // Reject names that are pure whitespace.
   return sawNonSpace;
 }
 
@@ -377,8 +936,22 @@ bool DatabaseManager::isValidValidDays(double validDays) {
   return validDays >= 0.0;
 }
 
+void DatabaseManager::reserveForImport(size_t additionalUsers) {
+  users_.reserve(users_.size() + additionalUsers);
+}
+
 void DatabaseManager::setImportMode(bool on) {
   importMode_ = on;
+  if (on) {
+    importBaselineCount_ = users_.size();
+    importSeen_.clear();
+  } else {
+    // Re-sort in one O(n log n) pass instead of O(n^2) per-insertion sort.
+    // Caller's save() then does one full already-in-order rewrite.
+    std::sort(users_.begin(), users_.end(), uidLess_);
+    importSeen_.clear();
+    importBaselineCount_ = 0;
+  }
 }
 
 bool DatabaseManager::addUserNoSave(const String& uid, const String& name,
@@ -389,15 +962,20 @@ bool DatabaseManager::addUserNoSave(const String& uid, const String& name,
   if (!isValidName(name)) { errorOut = "Invalid or empty name"; return false; }
   if (!isValidRegisteredDate(registered)) { errorOut = "Invalid 'registered' date (expected YYYY-MM-DD)"; return false; }
   if (!isValidValidDays(validDays)) { errorOut = "Invalid 'valid_days' (must be a non-negative number)"; return false; }
-  if (users_.size() >= MAX_USERS) { errorOut = "Database full (max 10000 users)"; return false; }
-  if (uidIndex_.count(norm)) { errorOut = "Duplicate UID"; return false; }
+  if (users_.size() >= MAX_USERS) { errorOut = "Database full (max " + String(MAX_USERS) + " users)"; return false; }
+
+  UidKey key = norm;
+  if (existsInBaseline_(key) || importSeen_.count(key)) {
+    errorOut = "Duplicate UID";
+    return false;
+  }
 
   UserRecord u;
   u.uid = norm;
   u.name = name;
   u.registered = registered;
   u.validDays = validDays;
-  users_.push_back(u);
-  uidIndex_[norm] = users_.size() - 1;
+  users_.push_back(u);  // deliberately unsorted here -- see setImportMode()
+  importSeen_.insert(key);
   return true;
 }
