@@ -2,16 +2,7 @@
 /*
  * SystemController.h
  * Orchestrates DatabaseManager + DisplayManager + RFIDManager + SerialProtocol.
- * This is the only class that knows the full state machine. Everything
- * else is a dumb-ish component with one job.
- *
- * All timing is millis()-based and the RFID/serial/buzzer loop never
- * blocks. The only blocking waits left in the firmware are bounded,
- * one-off admin/setup operations that already had this shape before Wi-Fi
- * was added: the boot-screen minimum-duration wait, and now Wi-Fi
- * connect + NTP sync (at boot, and when 'configure_wifi' is received).
- * Those are intentionally synchronous so the operator/CLI gets an
- * immediate success/failure result instead of a fire-and-forget one.
+ * Only class that knows the full state machine.
  */
 
 #include <Arduino.h>
@@ -26,10 +17,10 @@ enum class SystemState {
   BOOT,
   IDLE,
   SCAN_MODE,
-  RESULT_DISPLAY,   // showing ACCESS GRANTED / DENIED
-  UID_DISPLAY,       // showing the UID: xxxx screen that follows a result
+  RESULT_DISPLAY,
+  UID_DISPLAY,       // follows RESULT_DISPLAY
   DB_BUSY,
-  LOCKOUT           // too many consecutive denied badges -- reader ignores cards
+  LOCKOUT            // too many denied badges
 };
 
 class SystemController {
@@ -48,8 +39,7 @@ private:
   SystemState state_ = SystemState::BOOT;
   uint32_t stateEnteredMs_ = 0;
 
-  // Pending result data, set when a card is read, consumed by the
-  // RESULT_DISPLAY -> UID_DISPLAY transition.
+  // Pending card result, consumed by RESULT_DISPLAY -> UID_DISPLAY.
   bool pendingAccessGranted_ = false;
   String pendingName_;
   String pendingUid_;
@@ -58,16 +48,11 @@ private:
   bool renewalActive_ = false;
   double renewalValidDays_ = 0.0;
 
-  // Anti-brute-force: counts consecutive DENIED badges (reset on any
-  // GRANTED badge). At MAX_CONSECUTIVE_DENIALS the reader enters
-  // SystemState::LOCKOUT for LOCKOUT_DURATION_MS. See Config.h.
+  // Anti-brute-force lockout state (see Config.h).
   int consecutiveDenials_ = 0;
-  // Last "seconds remaining" value drawn on the LCD during LOCKOUT, so we
-  // only touch the (slow) I2C display once per second instead of once per
-  // update() call.
-  int32_t lockoutLastShownSec_ = -1;
+  int32_t lockoutLastShownSec_ = -1;  // LCD refresh throttle
 
-  // Serial connection tracking (native USB CDC on ESP32-S3 reflects host DTR)
+  // Serial connection tracking (USB CDC reflects host DTR)
   bool serialWasConnected_ = false;
   bool serialNoticeActive_ = false;
   uint32_t serialNoticeStartMs_ = 0;
