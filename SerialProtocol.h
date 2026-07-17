@@ -1,75 +1,100 @@
 #pragma once
 /*
  * SerialProtocol.h
- * Single responsibility: frame/deframe newline-terminated JSON messages
- * over Serial. Does NOT know what "add" or "scan" mean -- it hands parsed
- * JsonDocuments to a handler callback owned by SystemController.
+ * Newline-delimited JSON transport over Serial.
+ * Frames/parses messages and forwards JsonDocuments to SystemController.
+ * Command semantics live elsewhere.
  */
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <functional>
+#include <vector>
+#include <utility>
 
 using SerialMessageHandler = std::function<void(JsonDocument&)>;
 
 class SerialProtocol {
 public:
+  // RX line buffer. Must match Serial.setRxBufferSize() in
+  // SystemController::begin() to avoid truncated JSON.
+  // Sized for batch=100 (~6 KB) with generous headroom.
+  static const size_t kLineBufCapacity = 16384;
+
+  // Reported by the "status" command.
+  // Bump firmware on releases; bump protocol only for wire-format changes.
+  // Control traffic uses JSON; bulk import/export uses raw binary.
+  static constexpr const char* kFirmwareVersion = "1.1.0";
+  static constexpr const char* kProtocolVersion = "hybrid-json-ctrl+bin-bulk/v1";
+
   void begin(SerialMessageHandler handler);
 
-  // Call every loop() iteration. Non-blocking: reads whatever bytes are
-  // currently available and only parses once a full '\n'-terminated line
-  // has arrived.
+  // Non-blocking. Processes complete '\n'-terminated JSON messages.
   void poll();
 
   void sendOk();
   void sendError(const String& message);
   void sendUidDetected(const String& uid);
 
-  // Sends {"status":"ok","type":"remove_all_except","removed_count":N}
   void sendRemovedCount(size_t removedCount);
-
-  // Sends {"status":"ok"|"error","type":"wifi_status","connected":bool,"message":"..."}
   void sendWifiResult(bool connected, const String& message);
-
-  // Sends {"status":"ok"|"error","type":"ntp_sync","synced":bool,"message":"..."}
   void sendNtpSyncResult(bool synced, const String& message);
-
-  // Sends {"status":"ok","users":[{"uid":"...","name":"...",
-  //        "registered":"YYYY-MM-DD","valid_days":N}, ...]}
   void sendUserList(class DatabaseManager& db);
-
-  // Sends {"status":"ok","type":"status","db_path":"...",
-  //        "fs_total_bytes":N,"fs_used_bytes":N,"fs_free_bytes":N,
-  //        "user_count":N}
   void sendStatus(class DatabaseManager& db);
-
-  // Sends {"status":"ok","type":"net_status","connected":bool,
-  //        "ssid":"...","ip":"...","rssi":N,"time_synced":bool}
   void sendNetStatus(class WifiTimeManager& net);
 
-  // Sends {"status":"ok"|"error","type":"import_result","added":N,"errors":N}
-  void sendImportResult(size_t added, size_t errors);
+  // Import profiling is included in the response.
+  void sendImportResult(size_t added, size_t errors,
+                        const struct ImportProfile& prof);
 
-  // Sends {"status":"ok"|"error","type":"renewal_result","uid":"...","name":"...","registered":"...","valid_days":N}
+  // "ok" allows per-entry failures; "error" rejects the whole request.
+  void sendBatchAddResult(
+      size_t added,
+      size_t errors,
+      const std::vector<std::pair<String, String>>& failed);
+
   void sendRenewalResult(const String& uid, const String& name,
                          const String& registered, double validDays);
 
-  // Sends {"status":"ok","type":"time","epoch":N,"formatted":"YYYY-MM-DD HH:MM:SS"}
-  void sendTime(time_t epoch, const String& formatted);
+  // search_us measures device-side lookup only.
+  void sendFindResult(bool found, const String& uid, const String& name,
+                      const String& registered, double validDays,
+                      uint32_t searchUs);
 
-  // Sends {"status":"ok"|"error","type":"timezone","applied":bool,
-  //        "gmt_offset_sec":N,"daylight_offset_sec":N,"message":"..."}
-  void sendTimezoneResult(bool applied, long gmtOffsetSec, int daylightOffsetSec,
+  // Device-side name scan.
+  void sendFindNameResult(class DatabaseManager& db,
+                          const String& queryLower);
+
+  void sendTime(time_t epoch, const String& formatted);
+  void sendTimezoneResult(bool applied, long gmtOffsetSec,
+                          int daylightOffsetSec,
                           const String& message);
 
+  // Reads exactly len bytes. Short read indicates stream desynchronization.
+  size_t readRawExact(uint8_t* buf, size_t len,
+                      unsigned long overallTimeoutMs);
+
+  void writeRaw(const uint8_t* buf, size_t len);
+
+  // Announces an upcoming raw binary export.
+  void sendExportBinHeader(size_t totalBytes, size_t count);
+
+  // Final import summary.
+  void sendImportBinResult(size_t added, size_t errors);
+
+  // -- sync --
+  void sendSyncBeginResult(class DatabaseManager& db);
+  // Announces the upcoming raw manifest transfer (same header shape as
+  // export_bin, distinct "type" so the host can tell them apart).
+  void sendSyncManifestHeader(size_t totalBytes, size_t count);
+  void sendSyncResult(bool ok, const String& errorMessage, size_t removed,
+                      size_t added, size_t replaced, size_t errors,
+                      uint32_t dbCrc32);
+
 private:
-  // 4096 (not 1024) because 'remove_all_except' can carry an array of many
-  // UIDs in one line -- a few dozen UIDs plus JSON punctuation comfortably
-  // clears the old 1024-byte ceiling. ESP32-S3 has plenty of SRAM to spare.
-  static const size_t kLineBufCapacity = 4096;
   char lineBuf_[kLineBufCapacity];
   size_t lineLen_ = 0;
   SerialMessageHandler handler_;
 
-  void handleLine_(const char* line);
+  void handleLine_(char* line);
 };
