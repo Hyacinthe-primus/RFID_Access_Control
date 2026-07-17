@@ -1,6 +1,6 @@
 """
 utils.py
-Terminal output helpers. Uses `rich` if installed for nicer tables/colors,
+Terminal output helpers. Uses rich lib if installed for nicer tables/colors,
 falls back to plain print() so the CLI still works with zero extra deps.
 """
 
@@ -9,7 +9,7 @@ from typing import List
 try:
     from rich.console import Console
     from rich.table import Table
-    _console = Console()
+    console = Console()
     _HAVE_RICH = True
 except ImportError:
     _HAVE_RICH = False
@@ -17,23 +17,30 @@ except ImportError:
 
 def info(message: str) -> None:
     if _HAVE_RICH:
-        _console.print(f"[cyan]INFO[/cyan]  {message}")
+        console.print(f"[cyan]i[/cyan] {message}")
     else:
-        print(f"INFO  {message}")
+        print(f"i {message}")
 
 
 def success(message: str) -> None:
     if _HAVE_RICH:
-        _console.print(f"[green]OK[/green]    {message}")
+        console.print(f"[green]OK[/green] {message}")
     else:
-        print(f"OK    {message}")
+        print(f"+ {message}")
 
 
 def error(message: str) -> None:
     if _HAVE_RICH:
-        _console.print(f"[bold red]ERROR[/bold red] {message}")
+        console.print(f"[bold red]ERROR[/bold red] {message}")
     else:
-        print(f"ERROR {message}")
+        print(f"x {message}")
+
+
+def warning(message: str) -> None:
+    if _HAVE_RICH:
+        console.print(f"[yellow]WARN[/yellow] {message}")
+    else:
+        print(f"! {message}")
 
 
 def _human_bytes(n: float) -> str:
@@ -60,7 +67,7 @@ def print_status(status) -> None:
             f"({used_pct:.1f}%)",
         )
         table.add_row("Storage free", _human_bytes(status.fs_free_bytes))
-        _console.print(table)
+        console.print(table)
 
         bar_width = 40
         filled = int(bar_width * used_pct / 100)
@@ -69,7 +76,7 @@ def print_status(status) -> None:
             f"[{bar_color}]" + "█" * filled + "[/]"
             + "[grey37]" + "░" * (bar_width - filled) + "[/grey37]"
         )
-        _console.print(bar)
+        console.print(bar)
     else:
         print("Device Status")
         print("-" * 40)
@@ -103,7 +110,7 @@ def print_user_table(users: List) -> None:
             registered_cell = "-" if u.is_admin else u.registered
             valid_days_cell = "-" if u.is_admin else str(u.valid_days)
             table.add_row(u.uid, name_cell, registered_cell, valid_days_cell, expiration_date_str(u))
-        _console.print(table)
+        console.print(table)
     else:
         print(f"Registered Users ({len(users)})")
         print("-" * 40)
@@ -154,7 +161,7 @@ def print_net_status(status) -> None:
 
         time_cell = "[green]Synced[/green]" if status.time_synced else "[red]Not synced[/red]"
         table.add_row("NTP time", time_cell)
-        _console.print(table)
+        console.print(table)
     else:
         print("Network Status")
         print("-" * 40)
@@ -189,7 +196,7 @@ def print_port_table(ports: List) -> None:
                 p["device"], _format_id(p["vid"]), _format_id(p["pid"]),
                 p["manufacturer"], p["description"],
             )
-        _console.print(table)
+        console.print(table)
     else:
         print(f"Serial Ports ({len(ports)})")
         print("-" * 60)
