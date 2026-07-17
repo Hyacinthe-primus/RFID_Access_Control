@@ -1,7 +1,3 @@
-/*
- * RFIDManager.cpp
- */
-
 #include "RFIDManager.h"
 
 bool RFIDManager::begin() {
