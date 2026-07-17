@@ -1,7 +1,3 @@
-/*
- * BuzzerManager.cpp
- */
-
 #include "BuzzerManager.h"
 #include "Config.h"
 
