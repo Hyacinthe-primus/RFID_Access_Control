@@ -8,26 +8,33 @@
  *
  * Board:   ESP32-S3 Dev Module (QFN56, 8MB Octal PSRAM, 40MHz XTAL)
  * Arduino IDE settings that matter for THIS project:
- *   Tools > USB CDC On Boot        : Disabled   (required for Serial JSON link)
+ *   Tools > USB CDC On Boot        : Disabled
  *   Tools > Flash Size             : 16MB
- *   Tools > Partition Scheme       : Custom  (uses partitions.csv next to this .ino)
- *   Tools > PSRAM                  : OPI PSRAM  (verify against your module)
+ *   Tools > Partition Scheme       : Custom (uses partitions.csv)
+ *   Tools > PSRAM                  : OPI PSRAM
  *
- * See README.md for full wiring + setup instructions.
- * Note: The amount of flash used is limited to 12 MB by the partition scheme
+ * See README.md for wiring and setup instructions.
  */
 
 #include "SystemController.h"
+#include <esp_task_wdt.h>
 
 SystemController controller;
 
 void setup() {
+  // Register Arduino's loopTask with the Task Watchdog.
+  // Required before controller.begin(), which may temporarily manage
+  // TWDT membership during long LittleFS operations.
+  esp_task_wdt_add(NULL);
+
   controller.begin();
 }
 
 void loop() {
+  // Feed the Task Watchdog once per loop iteration.
+  esp_task_wdt_reset();
+
   controller.update();
-  // Intentionally no delay() here. RFID_POLL_TIMEOUT_MS inside RFIDManager
-  // already caps how long a single loop() iteration can take, which keeps
-  // the serial link responsive.
+
+  // No delay(): RFIDManager already limits the polling interval.
 }
